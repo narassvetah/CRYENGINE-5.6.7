@@ -487,7 +487,6 @@ private:
 	void InitMannequinParams();
 public:
 
-
 	enum EPlayerSounds
 	{
 		ESound_Player_First,

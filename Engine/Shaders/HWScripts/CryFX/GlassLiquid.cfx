@@ -1,0 +1,1088 @@
+// Copyright 2001-2019 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "ShadowCommon.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+	string Script =
+		"Public;"
+		"NoPreview;"        
+		"SupportsAttrInstancing;"   
+		"ShaderDrawType = Light;"  
+		"VertexColors;"
+		"AlphaBlendShadows;"
+#if %DEPTH_FOG
+		"ForceRefractionUpdate;"
+#else
+		"Refractive;"
+#endif
+		"ShaderType = Glass;";
+>;
+
+#ifndef %VERTCOLORS
+#define %VERTCOLORS
+#endif
+
+struct CustomForwardShadingAttribs
+{
+	half  backlightMask;
+};
+
+#include "ShadeLib.cfi"
+#include "VertexLib.cfi"
+
+ENVIRONMENTCUBEMAP
+
+sampler2D envMapSamplerRefr
+{
+	Texture = $SceneTarget;
+	MinFilter = POINT;
+	MagFilter = POINT;
+	MipFilter = POINT;  
+	AddressU = Clamp;
+	AddressV = Clamp;   
+	sRGBLookup = true; 
+};
+
+Texture2D tintTex : register(t2)
+<
+	UIName = "Tint Map";
+	sRGBLookup = true;
+> = TM_Specular;
+
+Texture2D tintColorTex : register(9)
+<
+	UIName = "Tint Colour Map";
+	sRGBLookup = true;
+> = TM_Custom;
+
+sampler2D decalSampler = sampler_state 
+{ 
+	Texture = %ENGINE%/EngineAssets/Textures/glass_decalatlas_diff.dds; 
+	MinFilter = LINEAR;
+	MagFilter = LINEAR;
+	MipFilter = LINEAR; 
+	AddressU = Clamp;
+	AddressV = Clamp;
+	sRGBLookup = true;  
+};
+
+sampler2D decalNormSampler = sampler_state 
+{ 
+	Texture = %ENGINE%/EngineAssets/Textures/glass_decalatlas_ddn.dds; 
+	MinFilter = LINEAR;
+	MagFilter = LINEAR;
+	MipFilter = LINEAR; 
+	AddressU = Clamp;
+	AddressV = Clamp;
+	sRGBLookup = false;
+};
+
+float BumpScale
+<
+	register = REG_PM_PARAM_0.x;
+	string UIHelp = "Set reflection / refraction bump scale";
+	string UIName = "Bump Scale";  
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.1;
+> = 0.1;
+
+float BackLightScale
+<
+	register = REG_PM_PARAM_0.y;
+	string UIHelp = "Set back lighting color scale";                     
+	string UIName = "Back light scale";    
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.5;
+
+float4 TintColor
+<
+	register = REG_PM_PARAM_1;
+	string UIHelp = "Set tint color";                   
+	string UIName = "Tint Color";    
+	string UIWidget = "color";
+> = {1.0, 1.0, 1.0, 1.0};
+
+float TintCloudiness
+<      
+	register = REG_PM_PARAM_2.x;
+	string UIName = "Tint Cloudiness";
+	string UIHelp = "Adjusts cloudiness of tinted areas";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.0;
+
+#if %DEPTH_FOG
+float FogDensity
+<
+	register = REG_PM_PARAM_2.y;
+	string UIName = "Fog density";
+	string UIWidget = "slider";
+	float UIMin = 0.0f;
+	float UIMax = 10.0f;
+	float UIStep = 0.001f;
+> = 1.0;
+
+float FogCutoffEnd
+<
+	register = REG_PM_PARAM_2.z;
+	string UIName = "Fog cutoff end depth";
+	string UIHelp = "After this many meters, fog does not get any stronger";
+	string UIWidget = "slider";
+	float UIMin = 0.0f;
+	float UIMax = 1000.0f;	
+	float UIStep = 0.001f;
+> = 20.0f;	
+
+float4 FogColor
+<
+	register = REG_PM_PARAM_3;  
+	string UIName = "Fog color";
+	string UIHelp = "Set fog color";
+	string UIWidget = "color";
+> = {1.0, 1.0, 1.0, 1.0};
+#endif
+
+#if %BLUR_REFRACTION && %TINT_MAP
+float CloudinessMasksBlur
+<      
+	register = REG_PM_PARAM_4.x;
+	string UIName = "Cloudiness Masks Blur";
+	string UIHelp = "Applies blur just to cloudy areas";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.0;
+#endif
+
+#if %BLUR_REFRACTION
+float BlurAmount
+<      
+	register = REG_PM_PARAM_4.y;
+	string UIName = "Blur Amount";
+	string UIHelp = "Controls amount of blur";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.001;
+> = 0.5;
+#endif
+
+#if %TINT_MAP
+float CloudinessReducesGloss
+<      
+	register = REG_PM_PARAM_4.z;        
+	string UIName = "Cloudiness Masks Gloss";
+	string UIHelp = "Makes cloudy areas less glossy";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.5;
+#endif
+
+#if %LIQUID
+float LiquidLevel
+<
+	register = REG_PM_PARAM_5.x;
+	string UIHelp = "Amount of liquid: 0 = empty, 1 = 100% full";
+	string UIName = "Liquid Amount (0-1)";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.5;
+
+float LiquidRadius
+<
+	register = REG_PM_PARAM_5.y;
+	string UIHelp = "Radius of liquid chamber in meters (half width)";
+	string UIName = "Liquid Radius (m)";
+	string UIWidget = "slider";
+	float UIMin = 0.005;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.04;
+
+float LiquidDensity
+<
+	register = REG_PM_PARAM_5.z;
+	string UIHelp = "Light absorption per unit thickness";
+	string UIName = "Liquid Density";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 20.0;
+	float UIStep = 0.01;
+> = 4.0;
+
+float BottleBase
+<
+	register = REG_PM_PARAM_5.w;
+	string UIHelp = "Position of bottom of chamber along local Z relative to pivot";
+	string UIName = "Bottle Base Offset (m)";
+	string UIWidget = "slider";
+	float UIMin = -3.0;
+	float UIMax = 3.0;
+	float UIStep = 0.001;
+> = 0.0;
+
+float4 LiquidColor
+<
+	register = REG_PM_PARAM_6;
+	string UIHelp = "Liquid color";
+	string UIName = "Liquid Color";
+	string UIWidget = "color";
+> = {0.9, 0.55, 0.1, 1.0};
+
+float WaveAmplitude
+<
+	register = REG_PM_PARAM_7.x;
+	string UIHelp = "Height of surface ripples (meters)";
+	string UIName = "Wave Amplitude";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 0.03;
+	float UIStep = 0.0001;
+> = 0.002;
+
+float WavePhase
+<
+	register = REG_PM_PARAM_7.y;
+	string UIHelp = "Time offset";
+	string UIName = "Time Offset (s)";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 600.0;
+	float UIStep = 0.01;
+> = 0.0;
+
+float SloshAmount
+<
+	register = REG_PM_PARAM_7.z;
+	string UIHelp = "Sloshing amplitude";
+	string UIName = "Slosh Amount";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 0.5;
+	float UIStep = 0.001;
+> = 0.05;
+
+float FoamHeight
+<
+	register = REG_PM_PARAM_7.w;
+	string UIHelp = "Thickness of foam layer";
+	string UIName = "Foam Height";
+	string UIWidget = "slider";
+	float UIMin = 0.0005;
+	float UIMax = 0.05;
+	float UIStep = 0.0005;
+> = 0.01;
+
+float FoamAmount
+<
+	register = REG_PM_PARAM_2.w;
+	string UIHelp = "Foam and sheen intensity";
+	string UIName = "Foam Amount";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.6;
+
+float SloshTiltX
+<
+	register = REG_PM_PARAM_2.y;
+	string UIHelp = "External surface slope X";
+	string UIName = "Slosh Tilt X";
+	string UIWidget = "slider";
+	float UIMin = -0.5;
+	float UIMax = 0.5;
+	float UIStep = 0.001;
+> = 0.0;
+
+float SloshTiltY
+<
+	register = REG_PM_PARAM_2.z;
+	string UIHelp = "External surface slope Y";
+	string UIName = "Slosh Tilt Y";
+	string UIWidget = "slider";
+	float UIMin = -0.5;
+	float UIMax = 0.5;
+	float UIStep = 0.001;
+> = 0.0;
+
+float BubbleScale
+<
+	register = REG_PM_PARAM_0.z;
+	string UIHelp = "Bubble grid density";
+	string UIName = "Bubble Scale";
+	string UIWidget = "slider";
+	float UIMin = 10.0;
+	float UIMax = 1000.0;
+	float UIStep = 1.0;
+> = 150.0;
+
+float BubbleAmount
+<
+	register = REG_PM_PARAM_0.w;
+	string UIHelp = "Bubble fraction";
+	string UIName = "Bubble Amount";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.35;
+
+float BubbleSize
+<
+	register = REG_PM_PARAM_4.x;
+	string UIHelp = "Bubble radius relative to grid cell";
+	string UIName = "Bubble Size";
+	string UIWidget = "slider";
+	float UIMin = 0.03;
+	float UIMax = 0.3;
+	float UIStep = 0.005;
+> = 0.18;
+
+float BubbleGravity
+<
+	register = REG_PM_PARAM_4.y;
+	string UIHelp = "Bubble rise/sink speed";
+	string UIName = "Bubble Gravity";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.5;
+
+float BottleLength
+<
+	register = REG_PM_PARAM_4.z;
+	string UIHelp = "Height of inner liquid chamber in meters";
+	string UIName = "Bottle Length (m)";
+	string UIWidget = "slider";
+	float UIMin = 0.01;
+	float UIMax = 3.0;
+	float UIStep = 0.001;
+> = 0.2;
+
+float4 BubbleColor
+<
+	register = REG_PM_PARAM_3;
+	string UIHelp = "Bubble color";
+	string UIName = "Bubble Color";
+	string UIWidget = "color";
+> = {0.9, 0.95, 1.0, 1.0};
+#endif
+
+float BumpMapTile
+<      
+	register = REG_PM_PARAM_4.w;
+	string UIName = "Bump Map Tiling";
+	string UIHelp = "Adjusts tiling of bump map independently from diffuse";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 20.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+#define gNumImpactDecals		8
+#define ResInfoImpactDecal	float2(2048.0f, 1024.0f)
+#define EXTRA_IMPACT_DECALS	1
+
+#define gNumImpactDecalElems 2
+float4 gImpactDecals[gNumImpactDecals * gNumImpactDecalElems];
+
+vert2FragGeneral GlassVS(app2vertGeneral IN)
+{
+	vert2FragGeneral OUT = (vert2FragGeneral)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	vs_shared_output( IN, OUT, vertPassPos, false );
+
+#if %LIQUID
+	float3 mfRow0 = float3(vertPassPos.InstMatrix[0][0], vertPassPos.InstMatrix[0][1], vertPassPos.InstMatrix[0][2]);
+	float3 mfRow1 = float3(vertPassPos.InstMatrix[1][0], vertPassPos.InstMatrix[1][1], vertPassPos.InstMatrix[1][2]);
+	float3 mfRow2 = float3(vertPassPos.InstMatrix[2][0], vertPassPos.InstMatrix[2][1], vertPassPos.InstMatrix[2][2]);
+	float3 mfLocal = vertPassPos.Position.xyz;
+	float3 mfRel = float3(dot(mfRow0, mfLocal), dot(mfRow1, mfLocal), dot(mfRow2, mfLocal));
+
+	float3 mfAxis = float3(mfRow0.z, mfRow1.z, mfRow2.z);
+	float mfAxisLen = length(mfAxis);
+	if (mfAxisLen < 0.000001)
+	{
+		mfAxis = float3(0.0, 0.0, 1.0);
+		mfRel = mfLocal;
+	}
+	else
+	{
+		mfAxis = mfAxis / mfAxisLen;
+	}
+
+	OUT.baseTC.z = mfRel.x;
+	OUT.baseTC.w = mfRel.y;
+	OUT.vView.w = mfRel.z;
+	OUT.vBinormal.w = mfAxis.x + ((mfAxis.z < 0.0) ? 4.0 : 0.0);
+	OUT.Color.r = mfAxis.y;
+#endif
+
+	return OUT;
+}
+
+void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightParams light, out float3 diffuseAcc, out float3 specularAcc)
+{
+#if !%UNLIT
+	const half lightWrap = 0.15h;
+
+	half NdotL = dot(attribs.normal, light.lightVec);
+	half frontLightMask = saturate(NdotL + lightWrap); 
+	half NdotLBackLight = saturate(-NdotL + lightWrap) * saturate(attribs.custom.backlightMask - (1 - (BackLightScale * 2))) + frontLightMask;
+
+	NdotL = saturate(NdotL);
+
+	if (light.type == LIGHT_TYPE_REGULAR_AREA)
+    {
+        AreaLightLTC_GGX(attribs.normal, -normalize(attribs.areaAttribs.position), attribs.smoothness, attribs.reflectance, attribs.areaAttribs.position,
+		                 attribs.areaAttribs.lightPos, attribs.areaAttribs.lightArrayIdx, attribs.areaAttribs.transform, Fwd_SpotTexArray, diffuseAcc, specularAcc);
+    }
+	else
+    {
+		half3 finalIlluminance = NdotL * light.illuminance * NdotLBackLight;
+		diffuseAcc = finalIlluminance;
+		specularAcc = SpecularBRDF(attribs.normal, -normalize(attribs.worldPos), light.lightVec, attribs.smoothness, attribs.reflectance) * finalIlluminance;
+    }
+
+#else
+	diffuseAcc = 0;
+	specularAcc = 0;
+#endif
+}
+
+#include "ForwardShading.cfi"
+
+#if %BLUR_REFRACTION
+half4 GetBlurredRefraction(float2 tcProj, half cloudiness)
+{
+	const int tapCount = 37;
+	const float fScale = BlurAmount * 0.003;
+
+	const float2 poisson[37] =
+	{		
+		float2(-1.0*fScale, 0), float2(-2.0*fScale, 0), float2(-3.0*fScale, 0), float2( 0.0, 0),
+		float2( 3.0*fScale, 0), float2( 2.0*fScale, 0), float2( 1.0*fScale, 0),
+		float2(-1.0*fScale, -1.0*fScale), float2(-2.0*fScale, -1.0*fScale), float2(-3.0*fScale, -1.0*fScale),
+		float2( 0.0, -1.0*fScale), float2( 3.0*fScale, -1.0*fScale), float2( 2.0*fScale, -1.0*fScale), float2( 1.0*fScale, -1.0*fScale),
+		float2(-1.0*fScale, 1.0*fScale), float2(-2.0*fScale, 1.0*fScale), float2(-3.0*fScale, 1.0*fScale),
+		float2( 0.0, 1.0*fScale), float2( 3.0*fScale, 1.0*fScale), float2( 2.0*fScale, 1.0*fScale), float2( 1.0*fScale, 1.0*fScale),
+		float2(-2.0*fScale,  2.0*fScale), float2(-1.0*fScale,  2.0*fScale), float2( 0.0, 2.0*fScale), float2( 1.0*fScale,  2.0*fScale), float2( 2.0*fScale,  2.0*fScale),
+		float2(-2.0*fScale, -2.0*fScale), float2(-1.0*fScale, -2.0*fScale), float2( 0.0, -2.0*fScale), float2( 1.0*fScale, -2.0*fScale), float2( 2.0*fScale, -2.0*fScale),
+		float2(-1.0*fScale, 3.0*fScale), float2( 0.0, 3.0*fScale), float2( 1.0*fScale, 3.0*fScale),
+		float2(-1.0*fScale, -3.0*fScale), float2( 0.0, -3.0*fScale), float2( 1.0*fScale, -3.0*fScale)
+	};
+	
+	half mask = 1;
+#if %TINT_MAP
+	mask = saturate(cloudiness + (1 - CloudinessMasksBlur));
+#endif
+
+	half4 cAcc = 0;
+	for (int t = 0; t < tapCount; t++)
+	{
+        half4 tap = Fwd_SceneTarget.Sample(ssMaterialBilinearClamp, tcProj + poisson[t] * mask);
+		cAcc += tap;
+	}
+
+	return cAcc / tapCount;
+}
+#endif
+
+float ComputeDepthFog(in float fDepth, in float fZBuffer, in float fFogDensity)
+{
+	float fBackgroundZ = fZBuffer - fDepth;
+	fBackgroundZ = min(fBackgroundZ, FogCutoffEnd);
+	return saturate( exp2( -fBackgroundZ * fFogDensity ) );
+}
+
+#if %LIQUID
+float2 MF_Hash22(float2 p)
+{
+	float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+	p3 += dot(p3, p3.yzx + 33.33);
+	return frac((p3.xx + p3.yz) * p3.zy);
+}
+
+float3 MF_Hash33(float3 p)
+{
+	p = frac(p * float3(0.1031, 0.1030, 0.0973));
+	p += dot(p, p.yxz + 33.33);
+	return frac((p.xxy + p.yxx) * p.zyx);
+}
+
+float4 MF_Voronoi(float2 uv)
+{
+	float2 ip = floor(uv);
+	float2 fp = frac(uv);
+	float  best = 8.0;
+	float2 bestRnd = float2(0, 0);
+	float2 bestCell = float2(0, 0);
+
+	for (int j = -1; j <= 1; j++)
+	{
+		for (int i = -1; i <= 1; i++)
+		{
+			float2 g = float2(i, j);
+			float2 h = MF_Hash22(ip + g);
+			float2 d = g + h - fp;
+			float  dist = dot(d, d);
+			if (dist < best)
+			{
+				best = dist;
+				bestRnd = h;
+				bestCell = ip + g;
+			}
+		}
+	}
+	float cover = MF_Hash22(bestCell + 17.31).x;
+	return float4(bestRnd, sqrt(best), cover);
+}
+
+float MF_Surface(float2 xy, float t, float R, float h, float slosh, float rippleAmp, float k)
+{
+	float s = saturate(length(xy) / R);
+	float th = atan2(xy.y, xy.x);
+
+	float k1 = 1.8412 / R;
+	float k2 = 3.0542 / R;
+	float k0 = 3.8317 / R;
+	float w1 = sqrt(9.81 * k1 * tanh(k1 * h));
+	float w2 = sqrt(9.81 * k2 * tanh(k2 * h));
+	float w0 = sqrt(9.81 * k0 * tanh(k0 * h));
+
+	float x1 = 1.8412 * s;
+	float x2 = 3.0542 * s;
+	float x0 = 3.8317 * s;
+	float x1s = x1 * x1;
+	float x2s = x2 * x2;
+	float x0s = x0 * x0;
+	float f1 = (x1 * 0.5 - x1 * x1s / 16.0 + x1 * x1s * x1s / 384.0 - x1 * x1s * x1s * x1s / 18432.0 + x1 * x1s * x1s * x1s * x1s / 1474560.0) / 0.5819;
+	float f2 = (x2s / 8.0 - x2s * x2s / 96.0 + x2s * x2s * x2s / 3072.0 - x2s * x2s * x2s * x2s / 184320.0) / 0.4865;
+	float f0 = 1.0 - x0s / 4.0 + x0s * x0s / 64.0 - x0s * x0s * x0s / 2304.0 + x0s * x0s * x0s * x0s / 147456.0 - x0s * x0s * x0s * x0s * x0s / 14745600.0;
+
+	float m1 = cos(th) * cos(w1 * t) + 0.7 * sin(th) * sin(w1 * t + 0.9);
+	float m2 = cos(2.0 * th) * cos(w2 * t + 0.4) + 0.5 * sin(2.0 * th) * sin(w2 * t);
+	float m0 = cos(w0 * t + 1.1);
+
+	float env = 0.65 + 0.35 * sin(0.31 * t + 0.5) * cos(0.17 * t);
+	float A1 = slosh * R;
+	float eta = env * A1 * (f1 * m1 + 0.35 * f2 * m2 + 0.25 * f0 * m0);
+	float lim = 0.5 * max(h, 0.02);
+	eta = clamp(eta, -lim, lim);
+
+	float kA = k;
+	float kB = k * 1.37;
+	float kC = k * 2.1;
+	float wA = sqrt(9.81 * kA + 0.000073 * kA * kA * kA);
+	float wB = sqrt(9.81 * kB + 0.000073 * kB * kB * kB);
+	float wC = sqrt(9.81 * kC + 0.000073 * kC * kC * kC);
+	float rip = sin(dot(xy, float2(0.8, 0.6)) * kA - wA * t)
+	          + 0.6 * sin(dot(xy, float2(-0.5, 0.87)) * kB - wB * t + 1.3)
+	          + 0.4 * sin(dot(xy, float2(0.3, -0.95)) * kC - wC * t + 2.1);
+
+	return eta + rippleAmp * rip * 0.5;
+}
+
+void MF_Clip(inout float t0, inout float t1, float c0, float c1)
+{
+	if (abs(c1) < 0.000001)
+	{
+		if (c0 < 0.0)
+			t1 = t0 - 1.0;
+	}
+	else
+	{
+		float tt = -c0 / c1;
+		if (c1 > 0.0)
+			t0 = max(t0, tt);
+		else
+			t1 = min(t1, tt);
+	}
+}
+
+float MF_DiskArea(float t, float R)
+{
+	float tc = clamp(t, -1.0, 1.0);
+	return R * R * (asin(tc) + tc * sqrt(max(1.0 - tc * tc, 0.0)) + 1.5707963);
+}
+
+float MF_DiskAreaInt(float t, float R)
+{
+	float tc = clamp(t, -1.0, 1.0);
+	float s = sqrt(max(1.0 - tc * tc, 0.0));
+	float gi = R * R * (tc * asin(tc) + s - s * s * s / 3.0 + 1.5707963 * tc);
+	if (t > 1.0)
+		gi += 3.1415927 * R * R * (t - 1.0);
+	return gi;
+}
+
+float MF_CylVolume(float z0, float az, float m, float R, float L, float base)
+{
+	float t0 = (z0 - base * az) / (m * R);
+	float k = az / (m * R);
+	float v = 0.0;
+	if (abs(k) < 0.0001)
+		v = L * MF_DiskArea(t0, R);
+	else
+		v = (MF_DiskAreaInt(t0, R) - MF_DiskAreaInt(t0 - k * L, R)) / k;
+	return v;
+}
+
+float MF_SolveLevel(float3 A, float R, float L, float base, float V)
+{
+	float m = max(sqrt(max(1.0 - A.z * A.z, 0.0)), 0.02);
+	float zlo = min(base * A.z, (base + L) * A.z) - m * R - 0.001;
+	float zhi = max(base * A.z, (base + L) * A.z) + m * R + 0.001;
+	float vt = clamp(V, 0.0, 3.1415927 * R * R * L);
+	for (int i = 0; i < 18; i++)
+	{
+		float zm = 0.5 * (zlo + zhi);
+		if (MF_CylVolume(zm, A.z, m, R, L, base) < vt)
+			zlo = zm;
+		else
+			zhi = zm;
+	}
+	return 0.5 * (zlo + zhi);
+}
+
+void MF_LiquidRay(float3 P, float3 D, float3 A, float radius, float base, float len, float level, float2 tilt, float foamH,
+                  out float tIn, out float tOut, out float foamLen, out float entrySurf)
+{
+	tIn = 0.0;
+	tOut = 1000.0;
+
+	float pa = dot(P, A);
+	float da = dot(D, A);
+	float3 Pp = P - A * pa;
+	float3 Dp = D - A * da;
+
+	float a = dot(Dp, Dp);
+	float b = 2.0 * dot(Pp, Dp);
+	float c = dot(Pp, Pp) - radius * radius;
+	if (a < 0.000001)
+	{
+		if (c > 0.0)
+			tOut = tIn - 1.0;
+	}
+	else
+	{
+		float disc = b * b - 4.0 * a * c;
+		if (disc < 0.0)
+		{
+			tOut = tIn - 1.0;
+		}
+		else
+		{
+			float sq = sqrt(disc);
+			tIn = max(tIn, (-b - sq) / (2.0 * a));
+			tOut = min(tOut, (-b + sq) / (2.0 * a));
+		}
+	}
+
+	MF_Clip(tIn, tOut, pa - base, da);
+	MF_Clip(tIn, tOut, base + len - pa, -da);
+
+	float cs0 = level + dot(tilt, P.xy) - P.z;
+	float cs1 = dot(tilt, D.xy) - D.z;
+	MF_Clip(tIn, tOut, cs0, cs1);
+
+	float tSurf = -1000.0;
+	if (abs(cs1) > 0.000001)
+		tSurf = -cs0 / cs1;
+	entrySurf = 0.0;
+	if (cs1 > 0.0 && abs(tIn - tSurf) < 0.0001)
+		entrySurf = 1.0;
+
+	float tf0 = tIn;
+	float tf1 = tOut;
+	MF_Clip(tf0, tf1, foamH - cs0, -cs1);
+	foamLen = max(tf1 - tf0, 0.0);
+}
+
+void MF_Bubbles(float3 P, float3 D, float tIn, float tOut, float S, float size, float gravity,
+                float time, float amount, float growH, out float fill, out float rim)
+{
+	fill = 0.0;
+	rim = 0.0;
+	float len = min(tOut - tIn, 12.0 / S);
+	float stepLen = 0.5 / S;
+
+	for (int layer = 0; layer < 3; layer++)
+	{
+		float sz = size * (0.45 + 0.275 * layer);
+		float rel = sz / max(size, 0.0001);
+		float vel = gravity * 0.12 * rel * rel;
+		float rMax = sz * 1.25;
+		float room = 0.5 - rMax;
+		float wf = 1.5 + 2.0 / rel;
+		float lo = layer * 17.3;
+
+		for (int i = 0; i < 24; i++)
+		{
+			float tt = (i + 0.5) * stepLen;
+			if (tt < len)
+			{
+				float3 pw = P + D * (tIn + tt);
+				float3 q = pw * S;
+				q.z -= vel * S * time;
+				q += lo;
+				float3 cell = floor(q);
+				float3 h = MF_Hash33(cell);
+				float on = step(MF_Hash33(cell + 7.7).x, amount * 0.5);
+				float rr = lerp(0.7, 1.0, h.x) * sz * (0.8 + 0.4 * saturate(pw.z / max(growH, 0.01)));
+				float cx = 0.5 + room * 0.7 * sin(time * wf + h.y * 6.2832);
+				float cy = 0.5 + room * 0.7 * cos(time * wf * 0.8 + h.x * 6.2832);
+				float cz = lerp(rMax, 1.0 - rMax, h.z);
+				float3 w = cell + float3(cx, cy, cz) - q;
+				float u = dot(w, D);
+				float b = length(w - D * u) / max(rr, 0.0001);
+				float edge = (1.0 - smoothstep(0.9, 1.0, b)) * on;
+				fill = max(fill, edge);
+				rim = max(rim, smoothstep(0.45, 0.9, b) * edge);
+			}
+		}
+	}
+}
+#endif
+
+pixout GlassPS(vert2FragGeneral IN, bool bIsFrontFace : SV_IsFrontFace)
+{
+	pixout OUT = (pixout) 0;
+	
+	ForwardShadingAttribs attribs;
+	attribs.screenUV = IN.screenProj.xy / IN.screenProj.w;
+	attribs.worldPos = IN.vView.xyz;
+	
+	attribs.reflectance = MatSpecColor.xyz;
+	attribs.smoothness = MatSpecColor.w;
+	
+	half4 tintMap = half4(1, 0, 1, 0);
+
+	ApplyDissolve(Get_SPI_Dissolve(), (int2)IN.WPos.xy);
+	
+#if !%DIRT_MAP
+	attribs.albedo = half3(0, 0, 0);
+	attribs.custom.backlightMask = 0;
+#else  
+	half4 diffuseMap = GetDiffuseTex(diffuseTex, IN.baseTC.xy);
+	attribs.albedo = diffuseMap.rgb * MatDifColor.xyz;
+	attribs.custom.backlightMask = diffuseMap.a;
+	const half reflectanceDielectricLow = 0.03;
+	attribs.reflectance = lerp(MatSpecColor.xyz, reflectanceDielectricLow, diffuseMap.a);
+#endif
+
+#if %SPECULAR_MAP
+	half3 specMap = GetTexture2D(tintTex, ssMaterialTrilinear, IN.baseTC.xy).xyz;
+
+	#if %TINT_MAP
+		tintMap.xyz = specMap.xyz;
+		attribs.smoothness *= saturate(1 - tintMap.y * CloudinessReducesGloss);
+		attribs.reflectance = tintMap.zzz;
+	#else
+		attribs.reflectance = specMap;
+	#endif
+#endif
+
+	attribs.smoothness *= GetSmoothnessTex(smoothnessTex, IN.baseTC.xy);
+
+	float3 vNormal = cross(IN.vTangent.xyz, IN.vBinormal.xyz) * IN.vTangent.w * (bIsFrontFace ? 1.0f : -1.0f);
+	float3x3 matTangentToWS = float3x3(IN.vTangent.xyz, IN.vBinormal.xyz, vNormal.xyz);
+	
+	half3 normalMap = GetNormalMap(normalsTex, IN.baseTC.xy * BumpMapTile);
+	attribs.normal = normalize(mul(normalMap.xyz, matTangentToWS));
+	attribs.normalSpecProbe = attribs.normal;
+
+	half3 diffuseAcc = 0;
+	half3 specularAcc = 0;
+	
+	{
+		float sunShadow = 1 - Fwd_SampleSunShadowMaps(attribs.worldPos + GetWorldViewPos());
+
+		ForwardLightParams lightParams;
+        lightParams.type = LIGHT_TYPE_SUN;
+		lightParams.lightVec = CV_SunLightDir.xyz;
+		lightParams.illuminance = CV_SunColor.xyz * sunShadow;
+		
+		Callback_ShadingDirect(attribs, lightParams, diffuseAcc, specularAcc);
+	}
+
+#if %_RT_TILED_SHADING
+	TiledForwardShading(attribs, diffuseAcc, specularAcc, ssFwdBilinearWrap, ssFwdComparison, true, true, true);
+#endif
+
+#if %LIQUID
+	float3 mfP = float3(IN.baseTC.z, IN.baseTC.w, IN.vView.w);
+	float3 mfD = normalize(attribs.worldPos);
+
+	float mfAxX_raw = IN.vBinormal.w;
+	float mfNeg = step(2.5, mfAxX_raw);
+	float mfAxX = mfAxX_raw - 4.0 * mfNeg;
+	float mfAxY = IN.Color.r;
+	float mfAxZ = sqrt(saturate(1.0 - mfAxX * mfAxX - mfAxY * mfAxY)) * (1.0 - 2.0 * mfNeg);
+	float3 mfA = normalize(float3(mfAxX, mfAxY, mfAxZ));
+
+#if %MF_LIQUID_TIME
+	float mfT = CV_AnimGenParams.z + WavePhase;
+#else
+	float mfT = WavePhase;
+#endif
+
+	float mfR = max(LiquidRadius, 0.005);
+	float mfLen = max(BottleLength, 0.01);
+	float mfBase = BottleBase;
+	float mfFillFraction = saturate(LiquidLevel);
+	float mfFill = mfFillFraction * mfLen;
+
+	float3 mfPerp = mfP - mfA * dot(mfP, mfA);
+	float mfRayR = max(mfR, length(mfPerp));
+	float mfFreq = 3.14159 / mfR * 1.2;
+	float mfDepthH = max(mfFill, 0.01);
+	float2 mfExtTilt = float2(SloshTiltX, SloshTiltY);
+	float mfFoamH = max(FoamHeight, 0.0005);
+
+	float mfIn, mfOut, mfFoamLen, mfEntrySurf;
+	float2 mfGrad = float2(0.0, 0.0);
+	float mfLevel = 0.0;
+	float2 mfTilt = float2(0.0, 0.0);
+
+	if (mfFillFraction >= 0.985)
+	{
+		// Режим 100% заполнености (без плоскости раздела и срезов)
+		float pa = dot(mfP, mfA);
+		float da = dot(mfD, mfA);
+		float3 Pp = mfP - mfA * pa;
+		float3 Dp = mfD - mfA * da;
+
+		mfIn = 0.0;
+		mfOut = 1000.0;
+		float a = dot(Dp, Dp);
+		float b = 2.0 * dot(Pp, Dp);
+		float c = dot(Pp, Pp) - mfRayR * mfRayR;
+		if (a >= 0.000001)
+		{
+			float disc = b * b - 4.0 * a * c;
+			if (disc >= 0.0)
+			{
+				float sq = sqrt(disc);
+				mfIn = max(mfIn, (-b - sq) / (2.0 * a));
+				mfOut = min(mfOut, (-b + sq) / (2.0 * a));
+			}
+			else
+			{
+				mfOut = -1.0;
+			}
+		}
+		MF_Clip(mfIn, mfOut, pa - mfBase, da);
+		MF_Clip(mfIn, mfOut, mfBase + mfLen - pa, -da);
+		mfFoamLen = 0.0;
+		mfEntrySurf = 0.0;
+	}
+	else
+	{
+		float mfBaseLevel = MF_SolveLevel(mfA, mfR, mfLen, mfBase, 3.14159 * mfR * mfR * mfFill);
+
+		float mfIn0, mfOut0, mfFoam0, mfEnt0;
+		MF_LiquidRay(mfP, mfD, mfA, mfRayR, mfBase, mfLen, mfBaseLevel + SloshAmount * mfR + WaveAmplitude, mfExtTilt, mfFoamH, mfIn0, mfOut0, mfFoam0, mfEnt0);
+
+		float mfE0 = 0.0;
+		if (mfOut0 > mfIn0)
+		{
+			float3 mfQ3 = mfP + mfD * ((mfEnt0 > 0.5) ? mfIn0 : mfOut0);
+			float mfEps = mfR * 0.01;
+			float3 mfQx = mfQ3 + float3(mfEps, 0.0, 0.0);
+			float3 mfQy = mfQ3 + float3(0.0, mfEps, 0.0);
+			float3 mfQp = mfQ3 - mfA * dot(mfQ3, mfA);
+			float3 mfQxp = mfQx - mfA * dot(mfQx, mfA);
+			float3 mfQyp = mfQy - mfA * dot(mfQy, mfA);
+			mfE0 = MF_Surface(mfQp.xy, mfT, mfR, mfDepthH, SloshAmount, WaveAmplitude, mfFreq);
+			float mfEx = MF_Surface(mfQxp.xy, mfT, mfR, mfDepthH, SloshAmount, WaveAmplitude, mfFreq);
+			float mfEy = MF_Surface(mfQyp.xy, mfT, mfR, mfDepthH, SloshAmount, WaveAmplitude, mfFreq);
+			mfGrad = float2(mfEx - mfE0, mfEy - mfE0) / mfEps;
+			mfE0 = mfE0 - dot(mfGrad, mfQ3.xy);
+		}
+
+		mfTilt = mfExtTilt + mfGrad;
+		mfLevel = mfBaseLevel + mfE0;
+
+		MF_LiquidRay(mfP, mfD, mfA, mfRayR, mfBase, mfLen, mfLevel, mfTilt, mfFoamH, mfIn, mfOut, mfFoamLen, mfEntrySurf);
+	}
+
+	float mfThick = max(mfOut - mfIn, 0.0);
+	float hitMask = smoothstep(0.0003, 0.002, mfThick);
+
+	float3 mfM = mfP + mfD * (mfIn + mfOut) * 0.5;
+	float2 mfVolUV = float2(mfM.x + mfM.y * 0.7, mfM.z);
+
+	float bubbleFill = 0.0;
+	float bubbleRim = 0.0;
+	if (hitMask > 0.0)
+		MF_Bubbles(mfP, mfD, mfIn, mfOut, BubbleScale, BubbleSize, BubbleGravity, mfT, BubbleAmount, mfLen, bubbleFill, bubbleRim);
+	bubbleFill *= hitMask;
+	bubbleRim *= hitMask;
+
+	float4 mfFoamCell = MF_Voronoi(mfVolUV * (BubbleScale * 0.3 + 20.0) + float2(0.3 * sin(mfT * 0.7), 0.3 * cos(mfT * 0.5)));
+	float foamOp = (1.0 - exp(-mfFoamLen / max(mfFoamH * 0.5, 0.0005))) * saturate(1.3 - mfFoamCell.z);
+
+	float3 mfE = mfP + mfD * mfIn;
+	float mfSurfAtE = mfLevel + dot(mfTilt, mfE.xy);
+	float mfDz = mfSurfAtE - mfE.z;
+	float mfNoSurface = (mfFillFraction >= 0.985) ? 0.0 : 1.0;
+	float mfMeniscus = exp(-(mfDz * mfDz) / (mfFoamH * mfFoamH * 0.0625 + 0.00000001)) * hitMask * (1.0 - mfEntrySurf) * mfNoSurface;
+
+	float3 mfNs = normalize(float3(-mfTilt, 1.0));
+	float mfFres = 0.02 + 0.98 * pow(1.0 - saturate(dot(mfNs, -mfD)), 5.0);
+	float mfGlint = pow(saturate(dot(reflect(mfD, mfNs), CV_SunLightDir.xyz)), 120.0);
+	float mfSheen = mfFres * hitMask * mfEntrySurf;
+	float mfGlintAmt = mfGlint * hitMask * mfEntrySurf;
+#endif
+
+	const half2 refractionNormScale = 0.1h * CV_HPosScale.xy;
+	half2 tcRefractionOffset = normalMap * refractionNormScale;		
+#if %LIQUID
+	tcRefractionOffset *= lerp(1.0, 1.5, hitMask);
+	tcRefractionOffset += mfGrad * 2.0 * hitMask * refractionNormScale;
+#endif
+
+	half3 cBackbuffer = 0;
+
+	float2 tcProj = (IN.screenProj.xy / IN.screenProj.w);
+
+	float fFarPlaneScale = CV_NearFarClipDist.y;
+#if %_RT_NEAREST
+	fFarPlaneScale /= CV_NearFarClipDist.z;
+#endif
+    
+    float2 screenCoords = floor(IN.WPos.xy);
+    float fZBufferRefrac = Fwd_SceneDepth[screenCoords].x * fFarPlaneScale;
+    tcProj += tcRefractionOffset * saturate(fZBufferRefrac - IN.screenProj.w);
+
+#if %BLUR_REFRACTION
+	cBackbuffer = GetBlurredRefraction(tcProj, tintMap.y).rgb;
+#else
+    cBackbuffer = Fwd_SceneTarget.Sample(ssMaterialBilinearClamp, tcProj).rgb;
+#endif
+
+#if %DEPTH_FOG
+	float fFogLevel = ComputeDepthFog(IN.screenProj.w, fZBufferRefrac, FogDensity);
+	cBackbuffer = lerp(FogColor.rgb, cBackbuffer, fFogLevel);
+#endif
+
+#if !%_RT_SECONDARY_VIEW && %_RT_FOG && !%_RT_DECAL_TEXGEN_2D && %_RT_VOLUMETRIC_FOG
+	half3 fogColor = 0.0f;
+	Fwd_ApplyFog(attribs.worldPos + GetWorldViewPos(), attribs.worldPos, IN.WPos, fogColor.xyz);
+	cBackbuffer -= fogColor.xyz;
+#endif
+
+	const half decalWhiteTint = 0.45h;
+	const half decalCloudiness = 0.45h;
+
+#if %_RT_SAMPLE0
+	half4 vertColor = IN.Color;
+#else
+	half4 vertColor = half4(1,1,1,1);
+#endif
+    float4 localTintColor = TintColor;
+	float localTintCloudiness = TintCloudiness;
+#if %TINT_COLOR_MAP 
+	localTintColor.xyz *= GetTexture2D(tintColorTex, ssMaterialTrilinear, IN.baseTC.xy).xyz;
+#endif
+	localTintColor.xyz = saturate(localTintColor.xyz * vertColor.rgb + tintMap.w * decalWhiteTint);
+      
+#if %TINT_MAP		
+	localTintCloudiness = saturate(localTintCloudiness * tintMap.x * tintMap.y + tintMap.w * decalCloudiness);
+	localTintColor.xyz = saturate(localTintColor.xyz + (1 - tintMap.x));
+#else
+	localTintCloudiness = saturate(localTintCloudiness + tintMap.w * decalCloudiness);
+#endif
+
+#if %LIQUID
+	float3 mfAbsorb = exp(-(1.0 - LiquidColor.rgb) * LiquidDensity * mfThick * 10.0);
+	mfAbsorb = lerp(mfAbsorb, float3(1.0, 1.0, 1.0), bubbleFill * 0.6);
+	localTintColor.xyz = lerp(localTintColor.xyz, mfAbsorb, hitMask);
+	localTintCloudiness = lerp(localTintCloudiness, 0.12 * (1.0 - exp(-mfThick * 40.0)), hitMask);
+#endif
+
+	half3 tintBackground = cBackbuffer * localTintColor.xyz;
+	half3 tintDiffuse = localTintColor.xyz * diffuseAcc;
+	half3 litDiffuse = attribs.albedo * diffuseAcc;
+
+	float3 viewVec = -normalize(attribs.worldPos);
+	half3 fresnel = GetEnvmapFresnel(attribs.reflectance, attribs.smoothness, saturate(dot(attribs.normal, viewVec)));
+
+#if %LIQUID
+	fresnel = half3(0.0h, 0.0h, 0.0h);
+#endif
+	half3 tintBlend = lerp(tintBackground, tintDiffuse, localTintCloudiness);
+	half3 cDiffuse = lerp(tintBlend, litDiffuse, attribs.custom.backlightMask);   
+#if %LIQUID
+	half3 mfLight = diffuseAcc + 0.25h;
+	cDiffuse += LiquidColor.rgb * ((1.0 - exp(-mfThick * 30.0)) * hitMask) * mfLight * 0.35;
+	cDiffuse += BubbleColor.rgb * (bubbleRim * 0.9 + bubbleFill * 0.2) * mfLight;
+	cDiffuse = lerp(cDiffuse, half3(0.95h, 0.95h, 0.9h) * mfLight, saturate(foamOp * FoamAmount * hitMask));
+	cDiffuse += mfMeniscus * FoamAmount * 0.5 * mfLight;
+	cDiffuse += mfSheen * FoamAmount * 0.6 * mfLight;
+	cDiffuse += mfGlintAmt * FoamAmount * CV_SunColor.xyz;
+#endif
+	half3 cSpecular = specularAcc.xyz;
+
+	half alpha = vertColor.a;
+#if %LIQUID
+	alpha *= hitMask;
+#endif
+	half4 cFinal = half4(lerp(cDiffuse, cSpecular, fresnel), alpha);	
+	
+	Fwd_ApplyFog(attribs.worldPos + GetWorldViewPos(), attribs.worldPos, IN.WPos, cFinal.xyz);
+
+	OUT.Color = cFinal;
+
+	return OUT;  
+}
+
+technique General
+<
+  string Script =     
+		"TechniqueMotionBlur=MotionBlurPass;"
+#ifndef %DEPTH_FOG
+		"TechniqueShadowGen=ShadowGen;"
+#endif
+>
+{  
+	pass p0
+	{
+		VertexShader = GlassVS() GlassVS;
+		PixelShader = GlassPS() GlassPS;
+		GeometryShader = $AutoGS_MultiRes();
+
+		CullMode = Back;
+		ZEnable = true;
+		ZWriteEnable = false;  
+
+		SrcBlend = SRC_ALPHA;
+		DestBlend = ONE_MINUS_SRC_ALPHA;
+		AlphaBlendEnable = true;
+	}
+}
+
+#include "CommonMotionBlurPass.cfi"
+#ifndef %DEPTH_FOG
+#include "ShadowCommon.cfi"
+#include "CommonShadowGenPass.cfi"
+#endif

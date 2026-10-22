@@ -1,0 +1,1170 @@
+// ScopeLens v2: процедурный шейдер линзы прицела (CryEngine 5.6, CryFX/HLSL).
+// Основа: Glass.cfx (структура, includes, Refractive, чтение копии сцены Fwd_SceneTarget).
+//
+// Что внутри:
+//  - 17 процедурных SDF-сеток (параметр Reticle Type), тумблер %NO_DOT гасит центральную точку на любой сетке
+//  - физика линзы: лунная тень (eye relief), параллакс коллиматора, сферическая дисторсия, хроматика, размытие по краям
+//  - %SCOPE_RTT: чёткая картинка из второй камеры (render texture в слоте материала) вместо зума кадра
+//  - %BROKEN_GLASS: разбитое стекло по карте нормалей (слот Bumpmap): преломление и блеск трещин
+//  - зум задаётся через FOV: Scope FOV (во сколько градусов "видит" линза) и Source FOV (FOV камеры, снявшей картинку)
+//  - %SCOPE_RTT: чёткая картинка из второй камеры (render texture в слоте Custom) вместо зума кадра
+//  - %SPECULAR_MAP: блики солнца на линзе, интенсивность и цвет берутся из карты Specular материала
+//  - %BROKEN_GLASS: разбитое стекло по карте нормалей (слот Bumpmap): преломление и блеск трещин
+//
+// Система координат линзы "p": центр (0,0), край стекла |p| = 1, +X вправо по UV, +Y вверх.
+// Система координат сетки "q": q = Rot(p - центр_сетки) / Reticle Scale. Размеры сеток заданы в q.
+// Геометрия линзы (метры, положение глаза) восстанавливается из ddx/ddy, тангенты не нужны.
+
+#include "Common.cfi"
+#include "ShadowCommon.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+	string Script =
+		"Public;"
+		"NoPreview;"
+		"SupportsAttrInstancing;"
+		"ShaderDrawType = Light;"
+		"VertexColors;"
+		"Refractive;"
+		"ShaderType = Glass;";
+>;
+
+#ifndef %VERTCOLORS
+#define %VERTCOLORS
+#endif
+
+struct CustomForwardShadingAttribs
+{
+	half  backlightMask;
+};
+
+#include "ShadeLib.cfi"
+#include "VertexLib.cfi"
+
+// ForwardShading.cfi объявляет Fwd_SceneTarget и требует заранее определённый Callback_ShadingDirect (как в Glass.cfx).
+// Линзе освещение от ламп не нужно, поэтому колбэк пустой.
+void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightParams light, out float3 diffuseAcc, out float3 specularAcc)
+{
+	diffuseAcc = 0;
+	specularAcc = 0;
+}
+
+#include "ForwardShading.cfi"
+
+#if %SCOPE_RTT
+// Картинка второй камеры (render texture). Слот Custom в редакторе материалов.
+Texture2D scopeRT : register(9)
+<
+	UIName = "Scope Image (render texture)";
+> = TM_Custom;
+#endif
+
+#if %SPECULAR_MAP
+// Карта Specular материала (тот же слот, что у Glass): где на стекле и каким цветом появляются блики.
+Texture2D scopeSpecTex : register(t2)
+<
+	UIName = "Specular Map";
+	sRGBLookup = true;
+> = TM_Specular;
+#endif
+
+// Константы стекла (раньше были слайдерами; регистры нужны под новые эффекты)
+#define SC_TRANSMISSION 0.96
+#define SC_RIM          0.06
+#define SC_DIRT_SCALE   8.0
+// радиус кольца у Circle-Dot, Ring, Ghost Ring, Horseshoe
+#define SC_RING_R       0.45
+// рост цели для дальномерных шкал, метры
+#define SC_TARGET_H     1.7
+// толщина тонких линий сетки
+#define SC_LINE_W       0.006
+// радиус видимой апертуры на оси (лунная тень)
+// мягкость края лунной тени
+// кривизна стекла для бликов
+#define SC_SPEC_CURVE   0.4
+// мягкость края и свечения точки
+#define SC_DOT_SOFT     0.35
+// тайлинг карты трещин по линзе
+#define SC_CRACK_TILE   1.0
+#define SC_PARALLAX     1.0
+#define SC_MIL_SCALE    0.05
+#define SC_SPEC_GLOSS   7.0
+#define SC_DEBUG        0.0
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Параметры материала: 8 регистров = 32 числа, дублей нет.
+// Раскладка: R0 сетка, R1 цвет сетки, R2 tint, R3 второй цвет градиента, R4 глаз и FOV, R5 дисторсия и сетка, R6 стекло, R7 блики, трещины, угол градиента.
+// Параметры опциональных эффектов объявлены внутри #if (как в стоковой воде), чтобы неиспользуемые регистры не мешали.
+// Редко нужные настройки (радиус кольца, рост цели, толщина линий, мягкость точки и тени, кривизна, масштаб карты трещин) стали константами: см. #define выше.
+
+// ---------------- регистр 0
+// Reticle Type, номера сеток:
+//  0 Dot, 1 Circle-Dot, 2 Crosshair-Dot, 3 Ring, 4 Three Post, 5 Chevron, 6 Ghost Ring, 7 Horseshoe,
+//  8 Fine Crosshair (RU K), 9 Duplex, 10 German 1, 11 German 4, 12 Mil-Dot, 13 TMR, 14 PSO-1, 15 Horus, 16 BDC,
+//  17 Penyok (RU S), 18 Cross-Circle (RU D), 19 Parabola (RU C), 20 Hunt-Plex, 21 FireDot Duplex,
+//  22 Boone and Crockett, 23 LR Varmint Hunter, 24 Wind-Plex, 25 MIL-XT, 26 MOA-XT, 27 Horus H59, 28 ACOG Chevron BDC
+float ScMode
+<
+	register = REG_PM_PARAM_0.x;
+	string UIHelp = "Reticle number 0 to 28, whole numbers only. The list is in the shader file";
+	string UIName = "Reticle Type";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 28.0;
+	float UIStep = 1.0;
+> = 0.0;
+
+float ScIntensity
+<
+	register = REG_PM_PARAM_0.y;
+	string UIHelp = "HDR brightness of the reticle (bloom picks up values above 1)";
+	string UIName = "Reticle Intensity (HDR)";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 50.0;
+	float UIStep = 0.1;
+> = 4.0;
+
+float ScDotRadius
+<
+	register = REG_PM_PARAM_0.z;
+	string UIHelp = "Radius of the center dot in reticle units (before Reticle Scale)";
+	string UIName = "Dot Radius";
+	string UIWidget = "slider";
+	float UIMin = 0.002;
+	float UIMax = 0.2;
+	float UIStep = 0.001;
+> = 0.03;
+
+float ScScale
+<
+	register = REG_PM_PARAM_0.w;
+	string UIHelp = "Overall size of the reticle on the glass. With First focal plane it is the size at zoom 1";
+	string UIName = "Reticle Scale";
+	string UIWidget = "slider";
+	float UIMin = 0.2;
+	float UIMax = 3.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+// ---------------- регистр 1
+float4 ScColor
+<
+	register = REG_PM_PARAM_1;
+	string UIHelp = "Reticle color. Dark colors give an etched (black) reticle, bright ones a glowing reticle";
+	string UIName = "Reticle Color";
+	string UIWidget = "color";
+> = {1.0, 0.04, 0.02, 1.0};
+
+// ---------------- регистры 2 и 3: tint стекла
+#if %LENS_TINT
+float4 ScTint
+<
+	register = REG_PM_PARAM_2;
+	string UIHelp = "Color filter of the glass: the image is multiplied by it. White = no tint. With Tint gradient this is the first color";
+	string UIName = "Tint Color";
+	string UIWidget = "color";
+> = {0.55, 0.75, 1.0, 1.0};
+#endif
+
+#if %TINT_GRADIENT
+float4 ScTint2
+<
+	register = REG_PM_PARAM_3;
+	string UIHelp = "Second color of the tint gradient";
+	string UIName = "Tint Gradient Color";
+	string UIWidget = "color";
+> = {0.08, 0.12, 0.2, 1.0};
+#endif
+
+// ---------------- регистр 4
+float ScShadowAperture
+<
+	register = REG_PM_PARAM_4.x;
+	string UIHelp = "Radius of the visible circle when the eye is on the optical axis. 1 = the whole glass, lower = a permanent dark ring at the rim";
+	string UIName = "Shadow Aperture";
+	string UIWidget = "slider";
+	float UIMin = 0.3;
+	float UIMax = 1.2;
+	float UIStep = 0.005;
+> = 0.92;
+
+float ScEyeSens
+<
+	register = REG_PM_PARAM_4.y;
+	string UIHelp = "Moon shadow: how far the visible circle travels when the eye leaves the optical axis. 0 = shadow off (use it to preview the lens from outside)";
+	string UIName = "Eye Relief Sensitivity";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 3.0;
+	float UIStep = 0.01;
+> = 0.8;
+
+float ScScopeFOV
+<
+	register = REG_PM_PARAM_4.z;
+	string UIHelp = "Field of view the lens shows, in degrees. Smaller = more zoom. Zoom = tan(Source FOV / 2) / tan(Scope FOV / 2). Use the same kind of FOV (horizontal or vertical) as for Source FOV";
+	string UIName = "Scope FOV (deg)";
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 120.0;
+	float UIStep = 0.1;
+> = 60.0;
+
+float ScSrcFOV
+<
+	register = REG_PM_PARAM_4.w;
+	string UIHelp = "FOV in degrees of the camera that produced the image: the main camera for the screen copy, the scope camera for the render texture. Set Scope FOV equal to it for no zoom";
+	string UIName = "Source FOV (deg)";
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 120.0;
+	float UIStep = 0.1;
+> = 60.0;
+
+// ---------------- регистр 5
+float ScFisheye
+<
+	register = REG_PM_PARAM_5.x;
+	string UIHelp = "Spherical distortion of the image: positive = barrel / fisheye, negative = pincushion";
+	string UIName = "Fisheye";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 2.0;
+	float UIStep = 0.01;
+> = 0.25;
+
+float ScRotation
+<
+	register = REG_PM_PARAM_5.y;
+	string UIHelp = "Rotates the reticle in degrees. Use it (or 180) if the reticle looks flipped on your mesh";
+	string UIName = "Reticle Rotation";
+	string UIWidget = "slider";
+	float UIMin = -180.0;
+	float UIMax = 180.0;
+	float UIStep = 1.0;
+> = 0.0;
+
+float ScShadowSoft
+<
+	register = REG_PM_PARAM_5.z;
+	string UIHelp = "Softness of the moon shadow edge";
+	string UIName = "Shadow Softness";
+	string UIWidget = "slider";
+	float UIMin = 0.005;
+	float UIMax = 0.5;
+	float UIStep = 0.005;
+> = 0.08;
+
+float ScShadowStrength
+<
+	register = REG_PM_PARAM_5.w;
+	string UIHelp = "How dark the moon shadow is. 1 = black, 0 = no shadow at all";
+	string UIName = "Shadow Strength";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+// ---------------- регистр 6: стекло
+#if %LENS_CHROMA
+float ScChroma
+<
+	register = REG_PM_PARAM_6.x;
+	string UIHelp = "Radial chromatic aberration, grows toward the rim";
+	string UIName = "Chromatic Aberration";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 3.0;
+	float UIStep = 0.01;
+> = 1.0;
+#endif
+
+#if %EDGE_BLUR
+float ScEdgeBlur
+<
+	register = REG_PM_PARAM_6.y;
+	string UIHelp = "Defocus blur at the edges of the glass";
+	string UIName = "Edge Blur";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.01;
+> = 0.6;
+#endif
+
+#if %COATING
+float ScCoating
+<
+	register = REG_PM_PARAM_6.z;
+	string UIHelp = "Anti-reflective coating: violet / green sheen of the glass visible at an angle";
+	string UIName = "Coating Strength";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.01;
+> = 1.0;
+#endif
+
+#if %LENS_DIRT
+float ScDirt
+<
+	register = REG_PM_PARAM_6.w;
+	string UIHelp = "Dust and micro-scratches (they show up on bright parts of the image)";
+	string UIName = "Dirt / Scratches";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.01;
+> = 0.5;
+#endif
+
+// ---------------- регистр 7: блики, трещины, градиент
+float ScShadowFadeDist
+<
+	register = REG_PM_PARAM_7.y;
+	string UIHelp = "Eye distance from the lens at which the moon shadow starts to fade out, it is gone at twice this distance. 0 = never fade. Keeps the lens clear when viewed from outside";
+	string UIName = "Shadow Fade Distance (m)";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 5.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+#if %SPECULAR_MAP
+float ScSpecStrength
+<
+	register = REG_PM_PARAM_7.x;
+	string UIHelp = "Brightness of the sun reflection on the glass, multiplied by the Specular map";
+	string UIName = "Specular Strength";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+#endif
+
+#if %BROKEN_GLASS
+float ScCrackStrength
+<
+	register = REG_PM_PARAM_7.z;
+	string UIHelp = "How broken the glass looks: refraction of the image by the crack normal map (Bumpmap slot) and the brightness of the cracks";
+	string UIName = "Crack Strength";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.01;
+> = 1.0;
+#endif
+
+#if %TINT_GRADIENT
+float ScGradAngle
+<
+	register = REG_PM_PARAM_7.w;
+	string UIHelp = "Direction of the gradient in degrees. The first tint color is at the start side, the second at the far side. 90 = first color at the bottom, second at the top";
+	string UIName = "Tint Gradient Angle";
+	string UIWidget = "slider";
+	float UIMin = -180.0;
+	float UIMax = 180.0;
+	float UIStep = 1.0;
+> = 90.0;
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Хэш
+
+// Хэш 2D -> 3 псевдослучайных числа в [0,1). Стабильный шум без текстур (пыль, царапины, трещины).
+float3 SC_Hash23(float2 p)
+{
+	float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+	p3 += dot(p3, p3.yzx + 33.33);
+	return frac((p3.xxy + p3.yzz) * p3.zyx);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// SDF-примитивы (SDF = расстояние со знаком до фигуры, < 0 внутри)
+
+// Расстояние от точки p до отрезка a-b (проекция на отрезок зажата в [0,1]).
+float SC_Seg(float2 p, float2 a, float2 b)
+{
+	float2 pa = p - a;
+	float2 ba = b - a;
+	float h = saturate(dot(pa, ba) / max(dot(ba, ba), 0.000001));
+	return length(pa - ba * h);
+}
+
+// Отрезок с линейно меняющимся радиусом (ra у точки a, rb у точки b): остриё, конус. Возвращает SDF.
+float SC_Taper(float2 p, float2 a, float2 b, float ra, float rb)
+{
+	float2 pa = p - a;
+	float2 ba = b - a;
+	float h = saturate(dot(pa, ba) / max(dot(ba, ba), 0.000001));
+	return length(pa - ba * h) - lerp(ra, rb, h);
+}
+
+// Кольцо радиуса R и полутолщины w: |  |p| - R | - w.
+float SC_Ring(float2 p, float R, float w)
+{
+	return abs(length(p) - R) - w;
+}
+
+// Покрытие пикселя 0..1 из SDF. edge = полуширина перехода (не меньше размера пикселя => края всегда сглажены).
+float SC_Cover(float d, float edge)
+{
+	return 1.0 - smoothstep(-edge, edge, d);
+}
+
+// Шеврон "^" с вершиной в apex: две ножки уходят вниз под 45 градусов, длина по осям = len. SDF без учёта толщины.
+float SC_Chevron(float2 q, float2 apex, float len)
+{
+	float2 r = q - apex;
+	float2 m = float2(abs(r.x), r.y);          // зеркало по X: одна ножка на обе стороны
+	return SC_Seg(m, float2(0.0, 0.0), float2(len, -len));
+}
+
+// Duplex с настраиваемой длиной тонкой части (thinLen) и толщиной толстых опор (thickMul, в толщинах тонкой линии).
+// noTop = 1: верхняя опора не толстая (German #4). Hunt-Plex = короче тонкая часть и толще опоры.
+float SC_DuplexEx(float2 q, float w, float thinLen, float thickMul, float noTop)
+{
+	float2 a = abs(q);
+	float thick = w * thickMul;
+	float dThin = min(SC_Seg(a, float2(0.0, 0.0), float2(thinLen, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, thinLen))) - w;
+	float dThick = SC_Seg(a, float2(thinLen, 0.0), float2(0.95, 0.0)) - thick;
+	if (noTop > 0.5)
+	{
+		// верх: только тонкая нить до края; низ: толстая опора
+		dThin = min(dThin, SC_Seg(q, float2(0.0, 0.0), float2(0.0, 0.95)) - w);
+		dThick = min(dThick, SC_Seg(q, float2(0.0, -thinLen), float2(0.0, -0.95)) - thick);
+	}
+	else
+	{
+		dThick = min(dThick, SC_Seg(a, float2(0.0, thinLen), float2(0.0, 0.95)) - thick);
+	}
+	return min(dThin, dThick);
+}
+
+// Duplex / German #4 (прежний вид)
+float SC_Duplex(float2 q, float w, float noTop)
+{
+	return SC_DuplexEx(q, w, 0.32, 5.0, noTop);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Сетки. Каждая строит SDF линий; центральная точка возвращается отдельно (чтобы %NO_DOT мог её погасить).
+
+// ПСО-1: каскад угольников вниз, горизонтальные штрихи, боковые угольники поправок и дальномерная шкала под рост tgtH.
+// Угловой размер фигуры в тысячных: mil = tgtH * 1000 / R(м). Шкала: столбик номер i = дальность (i + 1) * 100 м,
+// вершины столбиков соединены линией (получается гипербола 1/R, на глаз "парабола").
+float SC_PSO(float2 q, float w, float tgtH, float mil)
+{
+	float2 sq = float2(abs(q.x), q.y);
+	float d = 1000.0;
+
+	// каскад угольников: у каждого следующего вершина ниже и ножки короче
+	for (int k = 0; k < 6; k++)
+	{
+		float yk = -0.11 * float(k);
+		float lk = 0.13 - 0.016 * float(k);
+		float wk = w * ((k == 0) ? 1.6 : 1.1);
+		d = min(d, SC_Chevron(q, float2(0.0, yk), lk) - wk);
+	}
+
+	// горизонтальные прицельные штрихи с торцевыми засечками
+	d = min(d, SC_Seg(sq, float2(0.19, 0.0), float2(0.62, 0.0)) - w * 0.8);
+	d = min(d, SC_Seg(sq, float2(0.62, -0.025), float2(0.62, 0.025)) - w * 0.8);
+
+	// боковые угольники поправок: ближайший из трёх (x = 0.28, 0.40, 0.52)
+	float ci = clamp(round((sq.x - 0.28) / 0.12), 0.0, 2.0);
+	float cx = 0.28 + 0.12 * ci;
+	d = min(d, SC_Seg(sq, float2(cx, 0.0), float2(cx - 0.035, -0.035)) - w * 0.8);
+	d = min(d, SC_Seg(sq, float2(cx, 0.0), float2(cx + 0.035, -0.035)) - w * 0.8);
+
+	// дальномерная шкала слева
+	const float yBase = -0.30;
+	float pm = mil * 0.24;
+	d = min(d, SC_Seg(q, float2(-0.92, yBase), float2(-0.43, yBase)) - w * 0.7);
+	for (int i = 0; i < 10; i++)
+	{
+		float xi = -0.90 + 0.045 * float(i);
+		float hi = tgtH * 10.0 / (float(i) + 1.0) * pm;                  // высота фигуры на дальности (i+1)*100 м
+		float big = (frac((float(i) + 1.0) / 5.0) < 0.01) ? 1.7 : 1.0;  // 500 и 1000 м: засечка длиннее
+		d = min(d, SC_Seg(q, float2(xi, yBase), float2(xi, yBase + hi)) - w * 0.6);
+		d = min(d, SC_Seg(q, float2(xi - 0.014 * big, yBase + hi), float2(xi + 0.014 * big, yBase + hi)) - w * 0.7);
+		if (i < 9)
+		{
+			float hn = tgtH * 10.0 / (float(i) + 2.0) * pm;
+			d = min(d, SC_Seg(q, float2(xi, yBase + hi), float2(xi + 0.045, yBase + hn)) - w * 0.45);
+		}
+	}
+	return d;
+}
+
+// Horus / "ёлочка": крест + ряды горизонтальных планок, расширяющиеся вниз, с точками-милами в каждом ряду.
+// nRows = число рядов (до 14), rowMul = шаг рядов в милах, growMul = рост ширины ряда в милах, dotMul = шаг точек в милах.
+float SC_HorusEx(float2 q, float w, float mil, float nRows, float rowMul, float growMul, float dotMul)
+{
+	float2 a = abs(q);
+	float2 sq = float2(abs(q.x), q.y);                         // зеркало только по X: ряды лежат ниже центра (y < 0)
+	float dstep = mil * dotMul;
+	float d = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(q, float2(0.0, -0.95), float2(0.0, 0.95))) - w;
+	for (int k = 1; k <= 14; k++)
+	{
+		if (float(k) <= nRows)
+		{
+			float y = -rowMul * mil * float(k);
+			float hw = min(mil * (1.0 + growMul * float(k)), 0.62);
+			d = min(d, SC_Seg(sq, float2(0.0, y), float2(hw, y)) - w * 0.9);
+			float n = floor(hw / dstep);
+			float ix = clamp(round(sq.x / dstep), 0.0, n);
+			d = min(d, length(sq - float2(ix * dstep, y)) - max(dstep * 0.15, w * 1.2));
+		}
+	}
+	return d;
+}
+
+// Horus (прежний вид): 8 рядов
+float SC_Horus(float2 q, float w, float mil)
+{
+	return SC_HorusEx(q, w, mil, 8.0, 2.0, 1.3, 1.0);
+}
+
+// BDC: тонкий крест, вертикальная шкала дистанций (200..600 м, шаг 100 м): штрихи растут вниз, кружки на каждом втором.
+float SC_BDC(float2 q, float w)
+{
+	float2 a = abs(q);
+	float2 sq = float2(abs(q.x), q.y);                         // зеркало только по X: штрихи лежат ниже центра (y < 0)
+	float d = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(q, float2(0.0, -0.95), float2(0.0, 0.95))) - w;
+	for (int k = 1; k <= 5; k++)
+	{
+		float y = -0.16 * float(k);
+		float hw = 0.04 + 0.012 * float(k);
+		d = min(d, SC_Seg(sq, float2(0.0, y), float2(hw, y)) - w);
+		if (frac(float(k) * 0.5) < 0.01)
+			d = min(d, SC_Ring(q - float2(0.0, y), 0.02, w * 0.9));
+	}
+	return d;
+}
+
+// Пенёк (российская "S"): три толстых пенька с ровным срезом (слева, справа, снизу) и тонкие нити к центру.
+float SC_Penyok(float2 q, float w)
+{
+	float2 a = abs(q);
+	const float gap = 0.14;
+	float d = min(SC_Seg(a, float2(gap, 0.0), float2(0.95, 0.0)), SC_Seg(q, float2(0.0, -gap), float2(0.0, -0.95))) - w * 8.0;
+	float dThin = min(min(SC_Seg(a, float2(0.0, 0.0), float2(gap, 0.0)), SC_Seg(q, float2(0.0, 0.0), float2(0.0, 0.95))), SC_Seg(q, float2(0.0, 0.0), float2(0.0, -gap))) - w;
+	return min(d, dThin);
+}
+
+// Крест с окружностью (российская "D"): тонкий крест и кольцо вокруг центра.
+float SC_CrossCircle(float2 q, float w)
+{
+	float2 a = abs(q);
+	float d = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.95))) - w;
+	return min(d, SC_Ring(q, 0.2, w * 1.4));
+}
+
+// Парабола (российская "C"): крест и дальномерная шкала по центру. Столбик i = дальность (i + 1) * 100 м, высота
+// фигуры tgtH в сетке: mil * pm, mil = tgtH * 1000 / R. Вершины соединены, получается парабола (гипербола 1/R).
+float SC_Parabola(float2 q, float w, float tgtH, float mil)
+{
+	float2 a = abs(q);
+	float d = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.95))) - w;
+	const float yBase = -0.30;
+	float pm = mil * 0.24;
+	d = min(d, SC_Seg(q, float2(-0.74, yBase), float2(0.74, yBase)) - w * 0.8);
+	for (int i = 0; i < 8; i++)
+	{
+		float xi = -0.70 + 0.2 * float(i);
+		float hi = tgtH * 10.0 / (float(i) + 1.0) * pm;
+		d = min(d, SC_Seg(q, float2(xi, yBase), float2(xi, yBase + hi)) - w * 0.6);
+		if (i < 7)
+		{
+			float hn = tgtH * 10.0 / (float(i) + 2.0) * pm;
+			d = min(d, SC_Seg(q, float2(xi, yBase + hi), float2(xi + 0.2, yBase + hn)) - w * 0.5);
+		}
+	}
+	return d;
+}
+
+// Boone and Crockett (Leupold): Duplex, на нижней толстой опоре штрихи 300, 400, 500 ярдов.
+float SC_BooneCrockett(float2 q, float w)
+{
+	float2 sq = float2(abs(q.x), q.y);
+	float d = SC_DuplexEx(q, w, 0.32, 5.0, 0.0);
+	for (int k = 0; k < 3; k++)
+	{
+		float y = -(0.50 + 0.14 * float(k));
+		float hw = 0.05 + 0.012 * float(k);
+		d = min(d, SC_Seg(sq, float2(0.0, y), float2(hw, y)) - w * 0.9);
+	}
+	return d;
+}
+
+// LR Varmint Hunter (Leupold): тонкий крест с мелкими делениями каждые 0.05, длиннее каждое пятое, толстые концы.
+float SC_Varmint(float2 q, float w)
+{
+	float2 a = abs(q);
+	float d = min(SC_Seg(a, float2(0.0, 0.0), float2(0.70, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.70))) - w;
+	d = min(d, min(SC_Seg(a, float2(0.70, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.70), float2(0.0, 0.95))) - w * 5.0);
+	const float stp = 0.05;
+	float ix = clamp(round(a.x / stp), 1.0, 13.0);
+	float iy = clamp(round(a.y / stp), 1.0, 13.0);
+	float hlx = (frac(ix / 5.0) < 0.01) ? 0.03 : 0.015;
+	float hly = (frac(iy / 5.0) < 0.01) ? 0.03 : 0.015;
+	d = min(d, SC_Seg(a, float2(ix * stp, -hlx), float2(ix * stp, hlx)) - w * 0.8);
+	d = min(d, SC_Seg(a, float2(-hly, iy * stp), float2(hly, iy * stp)) - w * 0.8);
+	return d;
+}
+
+// Wind-Plex (Leupold): Duplex с засечками на тонких горизонтальных нитях для поправки на ветер.
+float SC_WindPlex(float2 q, float w)
+{
+	float2 a = abs(q);
+	float d = SC_DuplexEx(q, w, 0.32, 5.0, 0.0);
+	float ix = clamp(round(a.x / 0.08), 1.0, 3.0);
+	d = min(d, SC_Seg(a, float2(ix * 0.08, -0.022), float2(ix * 0.08, 0.022)) - w * 0.8);
+	return d;
+}
+
+// MIL-XT / MOA-XT (Nightforce): тонкий крест с засечками (длинная каждые longEvery шагов) и "плавающие" точки ниже креста.
+// step = шаг засечек, rowStep = шаг рядов точек, dotStep = шаг точек в ряду. Мелкие засечки, чаще 3 пикселей, не рисуются.
+float SC_MilXT(float2 q, float w, float tickStep, float longEvery, float rowStep, float dotStep, float px)
+{
+	float2 a = abs(q);
+	float2 sq = float2(abs(q.x), q.y);
+	float d = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.95))) - w;
+	float nT = clamp(floor(0.85 / tickStep), 1.0, 60.0);
+	float ix = clamp(round(a.x / tickStep), 1.0, nT);
+	float iy = clamp(round(a.y / tickStep), 1.0, nT);
+	float majX = (frac(ix / longEvery) < 0.01) ? 1.0 : 0.0;
+	float majY = (frac(iy / longEvery) < 0.01) ? 1.0 : 0.0;
+	float fine = (tickStep > 3.0 * px) ? 1.0 : 0.0;
+	float tickX = SC_Seg(a, float2(ix * tickStep, -((majX > 0.5) ? 0.03 : 0.015)), float2(ix * tickStep, (majX > 0.5) ? 0.03 : 0.015)) - w * 0.8;
+	float tickY = SC_Seg(a, float2(-((majY > 0.5) ? 0.03 : 0.015), iy * tickStep), float2((majY > 0.5) ? 0.03 : 0.015, iy * tickStep)) - w * 0.8;
+	d = min(d, (max(fine, majX) > 0.5) ? tickX : 1000.0);
+	d = min(d, (max(fine, majY) > 0.5) ? tickY : 1000.0);
+	for (int k = 1; k <= 7; k++)
+	{
+		float y = -rowStep * float(k);
+		float n = min(float(k) + 1.0, floor(0.55 / dotStep));
+		float jx = clamp(round(sq.x / dotStep), 0.0, n);
+		d = min(d, length(sq - float2(jx * dotStep, y)) - max(dotStep * 0.16, w * 1.2));
+	}
+	return d;
+}
+
+// ACOG TA31 (Trijicon): толстый шеврон, вертикаль вниз и стадиметрические горизонтали 300..800 м, чем дальше, тем уже.
+float SC_ACOG(float2 q, float w)
+{
+	float2 sq = float2(abs(q.x), q.y);
+	float d = SC_Chevron(q, float2(0.0, 0.0), 0.20) - w * 3.0;
+	d = min(d, SC_Seg(q, float2(0.0, -0.20), float2(0.0, -0.95)) - w);
+	for (int k = 1; k <= 6; k++)
+	{
+		float y = -0.20 - 0.115 * float(k);
+		float hw = 0.115 - 0.012 * float(k);
+		d = min(d, SC_Seg(sq, float2(0.0, y), float2(hw, y)) - w * 1.2);
+	}
+	return d;
+}
+
+// Выбор сетки по номеру t. dL = SDF линий, dD = SDF центральной точки (1000 = точки нет у этой сетки).
+void SC_Reticle(int t, float2 q, float w, float dotR, float ringR, float tgtH, float mil, float px, out float dL, out float dD)
+{
+	dL = 1000.0;
+	dD = 1000.0;
+	float2 a = abs(q);
+	float thick = w * 5.0;
+	float dDot = length(q) - dotR;
+
+	if (t == 0)                       // 1. Точка
+	{
+		dD = dDot;
+	}
+	else if (t == 1)                  // 2. Точка в круге (EOTech): кольцо + 4 засечки + точка
+	{
+		float tick = min(SC_Seg(a, float2(ringR, 0.0), float2(ringR + 0.05, 0.0)), SC_Seg(a, float2(0.0, ringR), float2(0.0, ringR + 0.05))) - w;
+		dL = min(SC_Ring(q, ringR, w * 1.4), tick);
+		dD = dDot;
+	}
+	else if (t == 2)                  // 3. Перекрестие с точкой: тонкий крест с зазором в центре
+	{
+		float gap = dotR * 2.5 + 0.02;
+		dL = min(SC_Seg(a, float2(gap, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, gap), float2(0.0, 0.95))) - w;
+		dD = dDot;
+	}
+	else if (t == 3)                  // 4. Круг без точки
+	{
+		dL = SC_Ring(q, ringR, w * 1.4);
+	}
+	else if (t == 4)                  // 5. Three Post / T-Dot: три жирные опоры (слева, справа, снизу)
+	{
+		float gap = 0.10 + dotR;
+		dL = min(SC_Seg(a, float2(gap, 0.0), float2(0.95, 0.0)), SC_Seg(q, float2(0.0, -gap), float2(0.0, -0.95))) - thick;
+		dD = dDot;
+	}
+	else if (t == 5)                  // 6. Шеврон
+	{
+		dL = SC_Chevron(q, float2(0.0, 0.0), 0.14) - w * 1.6;
+	}
+	else if (t == 6)                  // 7. Ghost Ring: крупное кольцо + тонкие боковые и верхне-нижние штрихи
+	{
+		float strokes = min(SC_Seg(a, float2(ringR + 0.04, 0.0), float2(ringR + 0.30, 0.0)), SC_Seg(a, float2(0.0, ringR + 0.04), float2(0.0, ringR + 0.16))) - w;
+		dL = min(SC_Ring(q, ringR, w * 3.0), strokes);
+		dD = dDot;
+	}
+	else if (t == 7)                  // 8. Подкова: кольцо, разомкнутое снизу (±40 градусов), с точкой и малым шевроном внутри
+	{
+		float dR = SC_Ring(q, ringR, w * 2.5);
+		float cosD = -q.y / max(length(q), 0.0001);              // косинус угла от направления "вниз"
+		dR = max(dR, (cosD - 0.765) * 0.3);                      // cos(40°) = 0.766: внутри разрыва SDF становится > 0
+		float chev = SC_Chevron(q, float2(0.0, -(dotR * 2.0 + 0.02)), 0.05) - w * 1.2;
+		dL = min(dR, chev);
+		dD = dDot;
+	}
+	else if (t == 8)                  // 9. Тонкий крест
+	{
+		dL = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.95))) - w;
+	}
+	else if (t == 9)                  // 10. Duplex
+	{
+		dL = SC_Duplex(q, w, 0.0);
+	}
+	else if (t == 10)                 // 11. German #1: толстые опоры слева/справа/снизу, нижняя кончается острым пиком в центре
+	{
+		float gt = thick * 1.5;
+		float sides = SC_Taper(a, float2(0.95, 0.0), float2(0.30, 0.0), gt, gt * 0.5);
+		float bottom = SC_Taper(q, float2(0.0, -0.95), float2(0.0, -0.02), gt, w * 0.5);
+		dL = min(sides, bottom);
+	}
+	else if (t == 11)                 // 12. German #4: Duplex без верхней толстой опоры
+	{
+		dL = SC_Duplex(q, w, 1.0);
+	}
+	else if (t == 12)                 // 13. Mil-Dot: тонкий крест, толстые концы, точки через каждый мил
+	{
+		float dCross = min(SC_Seg(a, float2(0.0, 0.0), float2(0.62, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.62))) - w;
+		float dPost = min(SC_Seg(a, float2(0.62, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.62), float2(0.0, 0.95))) - thick;
+		float s = max(mil, 0.01);
+		float nMax = clamp(floor(0.60 / s), 1.0, 12.0);
+		float ix = clamp(round(a.x / s), 1.0, nMax);
+		float iy = clamp(round(a.y / s), 1.0, nMax);
+		float dDotsX = length(a - float2(ix * s, 0.0)) - s * 0.28;
+		float dDotsY = length(a - float2(0.0, iy * s)) - s * 0.28;
+		dL = min(min(dCross, dPost), min(dDotsX, dDotsY));
+	}
+	else if (t == 13)                 // 14. TMR: крест с рисками; длинная риск на целых милах, короткая на половинах
+	{
+		float s = max(mil, 0.01);
+		float stp = s * 0.5;
+		float nT = clamp(floor(0.90 / stp), 1.0, 40.0);
+		float ix = clamp(round(a.x / stp), 1.0, nT);
+		float iy = clamp(round(a.y / stp), 1.0, nT);
+		float hlx = (frac(ix * 0.5) < 0.01) ? 0.028 : 0.014;
+		float hly = (frac(iy * 0.5) < 0.01) ? 0.028 : 0.014;
+		float tickX = SC_Seg(a, float2(ix * stp, -hlx), float2(ix * stp, hlx));
+		float tickY = SC_Seg(a, float2(-hly, iy * stp), float2(hly, iy * stp));
+		float dCross = min(SC_Seg(a, float2(0.0, 0.0), float2(0.95, 0.0)), SC_Seg(a, float2(0.0, 0.0), float2(0.0, 0.95)));
+		dL = min(dCross, min(tickX, tickY)) - w;
+	}
+	else if (t == 14)                 // 15. ПСО-1
+	{
+		dL = SC_PSO(q, w, tgtH, mil);
+	}
+	else if (t == 15)                 // 16. Horus / ёлочка
+	{
+		dL = SC_Horus(q, w, max(mil, 0.02));
+	}
+	else if (t == 16)                 // 17. BDC
+	{
+		dL = SC_BDC(q, w);
+		dD = dDot;
+	}
+	else if (t == 17)                 // 18. Пенёк (RU S)
+	{
+		dL = SC_Penyok(q, w);
+	}
+	else if (t == 18)                 // 19. Крест с окружностью (RU D)
+	{
+		dL = SC_CrossCircle(q, w);
+	}
+	else if (t == 19)                 // 20. Парабола (RU C)
+	{
+		dL = SC_Parabola(q, w, tgtH, mil);
+	}
+	else if (t == 20)                 // 21. Hunt-Plex
+	{
+		dL = SC_DuplexEx(q, w, 0.22, 9.0, 0.0);
+	}
+	else if (t == 21)                 // 22. FireDot Duplex: Duplex с яркой точкой
+	{
+		dL = SC_Duplex(q, w, 0.0);
+		dD = dDot;
+	}
+	else if (t == 22)                 // 23. Boone and Crockett
+	{
+		dL = SC_BooneCrockett(q, w);
+	}
+	else if (t == 23)                 // 24. LR Varmint Hunter
+	{
+		dL = SC_Varmint(q, w);
+	}
+	else if (t == 24)                 // 25. Wind-Plex
+	{
+		dL = SC_WindPlex(q, w);
+	}
+	else if (t == 25)                 // 26. MIL-XT: засечки каждые 0.5 мила, длинные на милах, плавающие точки в милах
+	{
+		dL = SC_MilXT(q, w, max(mil, 0.02) * 0.5, 2.0, max(mil, 0.02) * 2.0, max(mil, 0.02), px);
+	}
+	else if (t == 26)                 // 27. MOA-XT: 1 MOA = 0.2909 мила, засечки каждый MOA, длинные каждые 5, точки через 5 MOA
+	{
+		float moa = max(mil, 0.02) * 0.2909;
+		dL = SC_MilXT(q, w, moa, 5.0, moa * 10.0, moa * 5.0, px);
+	}
+	else if (t == 27)                 // 28. Horus H59: плотная ёлочка
+	{
+		dL = SC_HorusEx(q, w, max(mil, 0.02), 14.0, 1.2, 0.9, 0.6);
+	}
+	else                              // 29. ACOG chevron BDC
+	{
+		dL = SC_ACOG(q, w);
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Выборка изображения
+
+// Переход от точки линзы s к экранным UV (локальная линеаризация плоской линзы). tc0 = UV этого пикселя, p = его позиция на линзе,
+// Jx / Jy = производные экранных UV по p.x / p.y.
+float2 SC_TC(float2 tc0, float2 Jx, float2 Jy, float2 p, float2 s)
+{
+	return tc0 + Jx * (s.x - p.x) + Jy * (s.y - p.y);
+}
+
+// Одна выборка изображения в точке линзы s. Всегда SampleLevel(0): никаких автоматических mip.
+//  - с флагом %SCOPE_RTT: из render texture второй камеры (квадрат текстуры = поле зрения Source FOV, +Y вверх)
+//  - без флага: из копии сцены (зум кадра, чёткость ограничена разрешением экрана)
+float3 SC_Img(float2 tc0, float2 Jx, float2 Jy, float2 p, float2 s)
+{
+#if %SCOPE_RTT
+	return scopeRT.SampleLevel(ssMaterialBilinearClamp, float2(s.x, -s.y) * 0.5 + 0.5, 0).rgb;
+#else
+	return Fwd_SceneTarget.SampleLevel(ssMaterialBilinearClamp, SC_TC(tc0, Jx, Jy, p, s), 0).rgb;
+#endif
+}
+
+// Выборка со сглаживанием: для render texture 4 выборки по повёрнутой сетке (RGSS, смещения 1/8 и 3/8 пикселя).
+// Текстура второй камеры обычно больше, чем линза на экране, поэтому без этого картинка "лесенкой". Стоит 4 выборки.
+float3 SC_ImgSS(float2 tc0, float2 Jx, float2 Jy, float2 p, float2 s, float pxp)
+{
+#if %SCOPE_RTT
+	float3 c = SC_Img(tc0, Jx, Jy, p, s + float2(0.125, 0.375) * pxp);
+	c += SC_Img(tc0, Jx, Jy, p, s + float2(-0.375, 0.125) * pxp);
+	c += SC_Img(tc0, Jx, Jy, p, s + float2(-0.125, -0.375) * pxp);
+	c += SC_Img(tc0, Jx, Jy, p, s + float2(0.375, -0.125) * pxp);
+	return c * 0.25;
+#else
+	return SC_Img(tc0, Jx, Jy, p, s);
+#endif
+}
+
+// Изображение сквозь линзу: хроматика (красный выбирается дальше от центра, синий ближе: разница растёт с r^2)
+// и размытие по краям (6 выборок по спирали Фибоначчи, угол = i * золотой угол, только у края).
+float3 SC_Scene(float2 tc0, float2 Jx, float2 Jy, float2 p, float2 s0, float blurR, float ca, float r2, float edgeK, float pxp)
+{
+	float3 c;
+#if %LENS_CHROMA
+	c.g = SC_ImgSS(tc0, Jx, Jy, p, s0, pxp).g;
+	c.r = SC_ImgSS(tc0, Jx, Jy, p, s0 * (1.0 + ca * r2), pxp).r;
+	c.b = SC_ImgSS(tc0, Jx, Jy, p, s0 * (1.0 - ca * r2), pxp).b;
+#else
+	c = SC_ImgSS(tc0, Jx, Jy, p, s0, pxp);
+#endif
+
+#if %EDGE_BLUR
+	if (edgeK > 0.01)
+	{
+		float3 acc = float3(0.0, 0.0, 0.0);
+		for (int i = 0; i < 6; i++)
+		{
+			float a = float(i) * 2.39996;
+			float rr = sqrt((float(i) + 0.5) / 6.0);
+			float2 o = float2(cos(a), sin(a)) * rr * blurR;
+			acc += SC_Img(tc0, Jx, Jy, p, s0 + o);
+		}
+		c = lerp(c, acc / 6.0, saturate(edgeK));
+	}
+#endif
+	return c;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Грязь
+
+// Пылинки: сетка ячеек, в каждой с вероятностью 28% одна пылинка случайного размера и положения.
+float SC_Dust(float2 p, float scale)
+{
+	float2 g = p * scale;
+	float2 id = floor(g);
+	float2 f = frac(g) - 0.5;
+	float3 h = SC_Hash23(id);
+	float on = step(0.72, h.x);
+	float2 c = (h.yz - 0.5) * 0.5;
+	float r = 0.03 + 0.12 * h.y;
+	float d = length(f - c);
+	return (1.0 - smoothstep(r * 0.4, r, d)) * on;
+}
+
+// Микроцарапины: шесть случайных тонких отрезков (концы задаёт хэш). pxp = размер пикселя в p: линия не тоньше пикселя.
+float SC_Scratches(float2 p, float pxp)
+{
+	float acc = 0.0;
+	for (int i = 0; i < 6; i++)
+	{
+		float3 h = SC_Hash23(float2(float(i), 3.1));
+		float3 h2 = SC_Hash23(float2(float(i), 8.7));
+		float2 a = (h.xy - 0.5) * 2.0;
+		float2 dir = normalize(h2.xy - 0.5 + 0.001);
+		float2 b = a + dir * (0.4 + 0.9 * h.z);
+		float d = SC_Seg(p, a, b);
+		float wdt = max(0.0015 + 0.002 * h2.z, pxp);
+		acc += (1.0 - smoothstep(0.0, wdt, d)) * (0.35 + 0.65 * h2.z);
+	}
+	return saturate(acc);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Вершинный шейдер: стандартный (как в Glass)
+
+vert2FragGeneral ScopeVS(app2vertGeneral IN)
+{
+	vert2FragGeneral OUT = (vert2FragGeneral)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	vs_shared_output( IN, OUT, vertPassPos, false );
+
+	return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Пиксельный шейдер
+
+pixout ScopePS(vert2FragGeneral IN)
+{
+	pixout OUT = (pixout) 0;
+
+	// ---------------- координаты линзы p и все производные (до любых ветвлений)
+	float2 uv = IN.baseTC.xy;
+	float2 p = float2((uv.x - 0.5) * 2.0, (0.5 - uv.y) * 2.0);
+	float3 P = IN.vView.xyz;                                  // положение пикселя относительно камеры
+	float2 tcProj = IN.screenProj.xy / IN.screenProj.w;
+
+	float2 dpdx = ddx(p);
+	float2 dpdy = ddy(p);
+	float3 dPdx = ddx(P);
+	float3 dPdy = ddy(P);
+	float2 dtdx = ddx(tcProj);
+	float2 dtdy = ddy(tcProj);
+	float pxp = max(length(fwidth(p)), 0.00001);             // размер пикселя в единицах p
+
+	// Решаем линейную систему: как меняются мировая позиция и экранные UV при сдвиге по p.x и p.y.
+	float det = dpdx.x * dpdy.y - dpdx.y * dpdy.x;
+	float invDet = 1.0 / ((det >= 0.0) ? max(det, 0.00000000001) : min(det, -0.00000000001));
+	float3 Wx = (dPdx * dpdy.y - dPdy * dpdx.y) * invDet;     // dP / dp.x, метры на единицу p
+	float3 Wy = (dPdy * dpdx.x - dPdx * dpdy.x) * invDet;     // dP / dp.y
+	float2 Jx = (dtdx * dpdy.y - dtdy * dpdx.y) * invDet;     // d(экранные UV) / dp.x
+	float2 Jy = (dtdy * dpdx.x - dtdx * dpdy.x) * invDet;     // d(экранные UV) / dp.y
+
+	float r2 = dot(p, p);
+	float r = sqrt(r2);
+
+	// ---------------- что считается линзой: диск |p| <= 1
+	float inDisc = (r <= 1.0 + pxp * 2.0) ? 1.0 : 0.0;
+
+	// ---------------- положение глаза относительно линзы
+	float3 nrm = cross(Wx, Wy);
+	nrm /= max(length(nrm), 0.000000001);
+	float3 toEye = -P;
+	if (dot(nrm, toEye) < 0.0)
+		nrm = -nrm;
+	float dist = max(dot(toEye, nrm), 0.0001);                // вынос глаза: расстояние до плоскости линзы
+	float3 ePlane = toEye - nrm * dist;                        // проекция глаза на плоскость, смещение от пикселя
+	float2 eoRel = float2(dot(ePlane, Wx) / max(dot(Wx, Wx), 0.000000001), dot(ePlane, Wy) / max(dot(Wy, Wy), 0.000000001));
+	float2 eo = clamp(p + eoRel, float2(-4.0, -4.0), float2(4.0, 4.0));   // положение глаза на линзе, (0,0) = на оси
+	float cosV = dist / max(length(P), 0.0001);               // косинус угла взгляда к оси
+
+	// ---------------- лунная тень (Eye Relief)
+	// Луч из глаза через p доходит до трубы в p + (p - eo) * k (k = глубина трубы / вынос глаза).
+	// "Виден" <=> эта точка внутри круга трубы <=> |p - eo * k/(1+k)| < Aperture: круг видимости едет вслед за глазом,
+	// тёмный серп появляется с противоположной стороны.
+	// Эффект плавно пропадает, когда глаз далеко от линзы (вид со стороны): fadeK = 1 близко, 0 на расстоянии 2 * Fade Distance.
+	// Shadow Strength: 1 = чёрная тень, 0 = тени нет.
+	float fadeK = (ScShadowFadeDist > 0.001) ? (1.0 - smoothstep(ScShadowFadeDist, ScShadowFadeDist * 2.0, dist)) : 1.0;
+	float kEye = ScEyeSens;
+	float2 shadowC = eo * (kEye / (1.0 + kEye));
+	float visDist = length(p - shadowC);
+	float vis = 1.0 - smoothstep(ScShadowAperture - ScShadowSoft, ScShadowAperture, visDist);
+	vis = lerp(1.0, vis, saturate(ScShadowStrength) * fadeK);
+
+	// ---------------- маска стекла и тёмная оправа
+	float lensMask = 1.0 - smoothstep(1.0 - pxp * 1.5, 1.0, r);
+	float rim = smoothstep(1.0 - SC_RIM, 1.0, r);
+
+	// ---------------- отладка
+	if (SC_DEBUG > 0.5)
+	{
+		float3 dbg = float3(1.0, 0.0, 1.0);
+		if (SC_DEBUG > 1.5 && SC_DEBUG < 2.5)
+			dbg = float3(saturate(p * 0.5 + 0.5), 0.2) * (1.0 - 0.6 * smoothstep(0.97, 1.0, r));
+		else if (SC_DEBUG > 2.5 && SC_DEBUG < 3.5)
+			dbg = float3(vis, vis, vis);
+		else if (SC_DEBUG > 3.5)
+			dbg = float3(saturate(eo * 0.25 + 0.5), saturate(dist * 2.0));
+
+		OUT.Color = half4(dbg, 1.0);
+		return OUT;
+	}
+
+	// Разбитое стекло: карта нормалей из слота Bumpmap, натянутая на диск линзы. Читаем до clip: нужны градиенты для mip.
+	float2 crOff = float2(0.0, 0.0);
+	float crMask = 0.0;
+#if %BROKEN_GLASS
+	half3 crN = GetNormalMap(normalsTex, (p * 0.5 + 0.5) * SC_CRACK_TILE);
+	crOff = float2(crN.x, -crN.y) * ScCrackStrength * 0.15;     // сдвиг выборки в единицах p; +Y линзы смотрит вверх, V текстуры вниз
+	crMask = saturate((1.0 - crN.z) * 4.0);                    // трещины = места, где нормаль отклонена от плоской
+#endif
+
+	// всё, что вне диска линзы, не рисуется
+	clip(inDisc - 0.5);
+
+	// ---------------- сетка: положение (параллакс коллиматора) и поворот
+	// Сетка "на бесконечности": точка стекла p показывает направление от глаза eo через p, поэтому рисунок
+	// сдвигается вслед за проекцией глаза: центр сетки = eo * Parallax.
+	float2 rc = eo * SC_PARALLAX;
+	float2 pr = p - rc;
+	float ang = radians(ScRotation);
+	float ca0 = cos(ang);
+	float sa0 = sin(ang);
+	// зум из FOV нужен рано: в первой фокальной плоскости (FFP) сетка растёт вместе с увеличением, во второй (SFP) размер постоянный
+	float zoom = tan(radians(clamp(ScSrcFOV, 1.0, 120.0) * 0.5)) / tan(radians(clamp(ScScopeFOV, 1.0, 120.0) * 0.5));
+	float retScale = ScScale;
+#if %RETICLE_FFP
+	retScale *= zoom;
+#endif
+	float2 q = float2(ca0 * pr.x + sa0 * pr.y, -sa0 * pr.x + ca0 * pr.y) / retScale;
+	float pxq = pxp / retScale;
+	float wl = SC_LINE_W * 0.5;
+
+	float dL;
+	float dD;
+	SC_Reticle((int)(ScMode + 0.5), q, wl, ScDotRadius, SC_RING_R, SC_TARGET_H, SC_MIL_SCALE, pxq, dL, dD);
+#if %NO_DOT
+	dD = 1000.0;                                              // Убрать точку: центральная точка гасится на любой сетке
+#endif
+	float cover = max(SC_Cover(dL, max(pxq, 0.0004)), SC_Cover(dD, max(ScDotRadius * SC_DOT_SOFT, pxq)));
+	float glow = exp(-max(dD, 0.0) / (ScDotRadius * 2.5 + 0.0005)) * 0.45 * SC_DOT_SOFT;
+
+	// ---------------- сферическая дисторсия, увеличение и преломление трещинами
+	// s0 = p * (1 + Fisheye * r^2) / zoom: при Fisheye > 0 края выбирают дальше от центра, т.е. сжимаются (бочка).
+	// зум (zoom) посчитан выше: линза показывает поле зрения Scope FOV из картинки с полем зрения Source FOV
+	float2 s0 = p * (1.0 + ScFisheye * r2) / zoom + crOff;
+
+	// ---------------- изображение сквозь линзу
+	float blurR = 0.0;
+	float edgeK = 0.0;
+#if %EDGE_BLUR
+	edgeK = smoothstep(0.5, 1.0, r);
+	blurR = ScEdgeBlur * edgeK * edgeK * 0.06;
+#endif
+	float caK = 0.0;
+#if %LENS_CHROMA
+	caK = ScChroma * 0.03;
+#endif
+	float3 scene = SC_Scene(tcProj, Jx, Jy, p, s0, blurR, caK, r2, edgeK, pxp);
+	float lum = dot(scene, float3(0.299, 0.587, 0.114));
+	float3 col = scene * SC_TRANSMISSION;
+
+	// ---------------- tint стекла: цветной фильтр, умножается на изображение (не на сетку)
+#if %LENS_TINT
+	float3 tintCol = ScTint.rgb;
+#if %TINT_GRADIENT
+	// градиент вдоль направления Tint Gradient Angle: первый цвет в начале, второй в конце, по диску линзы
+	float ga = radians(ScGradAngle);
+	float gt = saturate(dot(p, float2(cos(ga), sin(ga))) * 0.5 + 0.5);
+	tintCol = lerp(ScTint.rgb, ScTint2.rgb, smoothstep(0.0, 1.0, gt));
+#endif
+	col *= tintCol;
+#endif
+
+	// ---------------- просветляющее покрытие
+	// Цвет отблеска зависит от угла взгляда (cosV) и от кривизны к краю; тонкоплёночная интерференция упрощена до палитры.
+#if %COATING
+	float fr = pow(saturate(1.0 - cosV), 3.0) + 0.12 * r2;
+	float tcoat = 0.5 + 0.5 * sin(fr * 9.0 + p.x * 1.3 - p.y * 0.7);
+	float3 cA = lerp(float3(0.55, 0.08, 0.85), float3(0.08, 0.85, 0.30), tcoat);
+	float3 cB = lerp(float3(0.10, 0.30, 1.00), float3(0.10, 0.90, 0.90), tcoat);
+	col += lerp(cA, cB, saturate(fr * 1.5)) * ScCoating * (0.02 + 0.45 * fr) * (0.25 + 0.75 * saturate(lum));
+#endif
+
+	// ---------------- микроцарапины и пыль: заметны на ярких участках картинки
+#if %LENS_DIRT
+	float dirt = SC_Dust(p, SC_DIRT_SCALE) + SC_Dust(p * 2.3 + 7.0, SC_DIRT_SCALE) * 0.6 + SC_Scratches(p, pxp) * 0.8;
+	col += float3(0.9, 0.95, 1.0) * saturate(dirt) * ScDirt * (0.03 + saturate(lum * 0.25));
+#endif
+
+	// ---------------- сетка: цвет заменяет изображение (тёмный = травление), HDR-яркость даёт свечение
+	float3 retCol = ScColor.rgb * ScIntensity;
+	col = lerp(col, retCol, saturate(cover));
+	col += ScColor.rgb * ScIntensity * glow;
+
+	// ---------------- поверх сетки: блики солнца (Specular Map)
+	// Рисуются после сетки и поверх неё: блик и трещины лежат на стекле выше точки и любых сеток.
+	// Выпуклая линза: нормаль наклоняется к краю на Lens Curvature (оси линзы = нормированные Wx, Wy).
+	// Блик Блинна-Фонга: pow(N.H, 2^Gloss) с нормировкой (n + 8) / (8 pi) ~ (n + 8) * 0.04. Маска и цвет блика из карты Specular.
+#if %SPECULAR_MAP
+	float3 nSpec = normalize(nrm + (normalize(Wx) * p.x + normalize(Wy) * p.y) * SC_SPEC_CURVE);
+	float3 hSpec = normalize(normalize(CV_SunLightDir.xyz) + normalize(toEye));
+	float specExp = exp2(clamp(SC_SPEC_GLOSS, 1.0, 12.0));
+	float specTerm = pow(saturate(dot(nSpec, hSpec)), specExp) * (specExp + 8.0) * 0.04;
+	half3 specMask = GetTexture2D(scopeSpecTex, ssMaterialTrilinear, IN.baseTC.xy).xyz;
+	float3 sunTint = CV_SunColor.xyz;
+	sunTint /= max(max(sunTint.x, max(sunTint.y, sunTint.z)), 0.001);
+	col += sunTint * specMask * specTerm * ScSpecStrength;
+#endif
+
+	// ---------------- поверх сетки: блеск трещин по карте нормалей (Bumpmap)
+#if %BROKEN_GLASS
+	col += float3(0.9, 0.95, 1.0) * crMask * (ScCrackStrength * 0.6) * (0.30 + 0.9 * saturate(lum));
+#endif
+
+	// ---------------- тень трубы и оправа
+	col *= vis * (1.0 - rim * 0.85);
+
+	OUT.Color = half4(col, lensMask);
+	return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// technique
+
+technique General
+{
+	pass p0
+	{
+		VertexShader = ScopeVS() ScopeVS;
+		PixelShader = ScopePS() ScopePS;
+		GeometryShader = $AutoGS_MultiRes();
+
+		CullMode = Back;
+		ZEnable = true;
+		ZWriteEnable = false;
+
+		SrcBlend = SRC_ALPHA;
+		DestBlend = ONE_MINUS_SRC_ALPHA;
+		AlphaBlendEnable = true;
+	}
+}

@@ -2046,6 +2046,7 @@ void CPlayer::SetTagByCRC(uint32 tagCRC, bool enable)
 
 void CPlayer::UpdateAnimationState(const SActorFrameMovementParams& frameMovementParams)
 {
+
 	//--- Update variable scope contexts
 	CWeapon* pWeapon = GetWeapon(GetCurrentItemId());
 	ICharacterInstance* pICharInst = pWeapon ? pWeapon->GetEntity()->GetCharacter(0) : NULL;
@@ -2524,6 +2525,8 @@ void CPlayer::UpdateView(SViewParams& viewParams)
 			pNetContext->ChangedFov(GetEntityId(), viewParams.fov);
 		}
 	}
+
+
 #endif
 
 	m_isControllingCamera = true;
@@ -2541,10 +2544,398 @@ void CPlayer::UpdateView(SViewParams& viewParams)
 		CryLog("CPlayer::UpdateView: Post Pos(%f, %f, %f) Rot(%f, %f, %f, %f)", viewParams.position.x, viewParams.position.y, viewParams.position.z, viewParams.rotation.v.x, viewParams.rotation.v.y, viewParams.rotation.v.z, viewParams.rotation.w);
 		CryWatch("CPlayer::UpdateView: (%f %f %f)  Rot(%f, %f, %f, %f)", viewParams.position.x, viewParams.position.y, viewParams.position.z, viewParams.rotation.v.x, viewParams.rotation.v.y, viewParams.rotation.v.z, viewParams.rotation.w);
 	}
+
+
 #endif //_RELEASE
 
-	// pass view params to UI manager (used for per entity tags, 3d hud)
-	g_pGame->GetUI()->ProcessViewParams(viewParams);
+	// ============================================================================
+	// CAMERA EFFECT: IDLE BREATHING & SWAY ONLY (CryEngine 5.6.7)
+	// ============================================================================
+	if (IsClient())
+	{
+		const float frameTime = gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.016f;
+
+		// Статика для накопителя времени и углов
+		static float s_idleBreathingTimer = 0.0f;
+		static Ang3  s_idleBreathingOffset(ZERO);
+
+		// Получение скорости игрока
+		Vec3 currentVelocity(ZERO);
+		if (IEntity* pSelfEntity = GetEntity())
+		{
+			if (IPhysicalEntity* pPhys = pSelfEntity->GetPhysics())
+			{
+				pe_status_dynamics status;
+				if (pPhys->GetStatus(&status))
+				{
+					currentVelocity = status.v;
+				}
+			}
+		}
+
+		float currentSpeed = currentVelocity.GetLength2D();
+		bool isCrouching = (GetStance() == STANCE_CROUCH);
+
+		// ------------------------------------------------------------------------
+		// IDLE-ПОКАЧИВАНИЕ (Только в покое)
+		// ------------------------------------------------------------------------
+		if (currentSpeed < 0.2f)
+		{
+			s_idleBreathingTimer += frameTime * 2.2f;
+
+			// Восьмёрка синусоид для эффекта дыхания Bodycam
+			float pitchBreath = sinf(s_idleBreathingTimer) * 0.0070f;
+			float yawBreath = cosf(s_idleBreathingTimer * 0.5f) * 0.0050f;
+			float rollBreath = sinf(s_idleBreathingTimer * 0.75f) * 0.0040f;
+
+			// В приседе делаем покачивание чуть ровнее
+			if (isCrouching)
+			{
+				pitchBreath *= 0.6f;
+				yawBreath *= 0.6f;
+				rollBreath *= 0.6f;
+			}
+
+			s_idleBreathingOffset.x = LERP(s_idleBreathingOffset.x, pitchBreath, clamp_tpl(10.0f * frameTime, 0.0f, 1.0f));
+			s_idleBreathingOffset.y = LERP(s_idleBreathingOffset.y, rollBreath, clamp_tpl(10.0f * frameTime, 0.0f, 1.0f));
+			s_idleBreathingOffset.z = LERP(s_idleBreathingOffset.z, yawBreath, clamp_tpl(10.0f * frameTime, 0.0f, 1.0f));
+		}
+		else // При движении дыхание плавно тухнет
+		{
+			s_idleBreathingTimer = 0.0f;
+			s_idleBreathingOffset = LERP(s_idleBreathingOffset, Ang3(ZERO), clamp_tpl(12.0f * frameTime, 0.0f, 1.0f));
+		}
+
+		// ------------------------------------------------------------------------
+		// ПРИМЕНЕНИЕ К КАМЕРЕ
+		// ------------------------------------------------------------------------
+		Quat idleBreathingRot = Quat::CreateRotationXYZ(s_idleBreathingOffset);
+		viewParams.rotation = viewParams.rotation * idleBreathingRot;
+	}
+
+	// ============================================================================
+	// BODYCAM WEAPON LAG & SMART RECOIL (Monolith - CE 5.6.7)
+	// ============================================================================
+	if (IsClient())
+	{
+		const float frameTime = gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.016f;
+
+		// ------------------------------------------------------------------------
+		// ПРОВЕРКА ОРУЖИЯ И ИСКЛЮЧЕНИЕ ГРАНАТ
+		// ------------------------------------------------------------------------
+		IItem* pCurrentItem = GetCurrentItem();
+		IWeapon* pCurrentWeapon = pCurrentItem ? pCurrentItem->GetIWeapon() : nullptr;
+
+		bool hasRealWeapon = (pCurrentWeapon != nullptr) && (pCurrentItem != nullptr);
+
+		if (hasRealWeapon)
+		{
+			if (IEntity* pItemEntity = pCurrentItem->GetEntity())
+			{
+				if (pItemEntity->IsHidden())
+				{
+					hasRealWeapon = false;
+				}
+				else
+				{
+					// Фикс багов с гранатами / C4 / OffHand (без cry_stristr)
+					if (const char* itemClass = pItemEntity->GetClass()->GetName())
+					{
+						CryStringLocal itemClassStr(itemClass);
+						itemClassStr.MakeLower();
+
+						if (itemClassStr.find("grenade") != CryStringLocal::npos ||
+							itemClassStr.find("offhand") != CryStringLocal::npos ||
+							itemClassStr.find("c4") != CryStringLocal::npos)
+						{
+							hasRealWeapon = false;
+						}
+					}
+				}
+			}
+		}
+
+		bool isShooting = false;
+		bool isAutomatic = false;
+		bool isZoomed = false; // Состояние прицеливания (ADS)
+
+		if (hasRealWeapon)
+		{
+			isZoomed = pCurrentWeapon->IsZoomed();
+
+			if (IFireMode* pFireMode = pCurrentWeapon->GetFireMode(pCurrentWeapon->GetCurrentFireMode()))
+			{
+				isShooting = pFireMode->IsFiring();
+
+				const char* fireModeName = pFireMode->GetName();
+				if (fireModeName)
+				{
+					// Все одиночные, помпа и дробовики НЕ считаем автоматом
+					isAutomatic = (cry_stricmp(fireModeName, "Single") != 0) &&
+						(cry_stricmp(fireModeName, "SingleTrigger") != 0) &&
+						(cry_stricmp(fireModeName, "Pump") != 0) &&
+						(cry_stricmp(fireModeName, "Shotgun") != 0);
+				}
+			}
+		}
+
+		// ------------------------------------------------------------------------
+		// СБРОС СТАТИКИ ПРИ БРОСКЕ ГРАНАТЫ ИЛИ ОТСУТСТВИИ ОРУЖИЯ
+		// ------------------------------------------------------------------------
+		static Ang3 s_weaponLagOffset(ZERO);
+		static Ang3 s_recoilImpulse(ZERO);
+		static Ang3 s_recoilOffset(ZERO);
+		static float s_fovKick = 0.0f;
+		static float s_shakeIntensity = 0.0f;
+		static float s_fireTimer = 0.0f;
+		static bool s_wasShooting = false;
+
+		// Если оружия нет в руках / идет бросок гранаты — мгновенно обнуляем накопители
+		if (!hasRealWeapon)
+		{
+			s_weaponLagOffset = Ang3(ZERO);
+			s_recoilImpulse = Ang3(ZERO);
+			s_recoilOffset = Ang3(ZERO);
+			s_fovKick = 0.0f;
+			s_shakeIntensity = 0.0f;
+			s_fireTimer = 0.0f;
+			s_wasShooting = false;
+		}
+
+		// ------------------------------------------------------------------------
+		// 1. Считываем ввод мыши (только при активном оружии)
+		// ------------------------------------------------------------------------
+		float mouseX = 0.0f;
+		float mouseY = 0.0f;
+
+		if (hasRealWeapon && gEnv->pInput)
+		{
+			const SInputSymbol* pSymbolX = gEnv->pInput->GetSymbolByName("maxis_x");
+			const SInputSymbol* pSymbolY = gEnv->pInput->GetSymbolByName("maxis_y");
+
+			if (pSymbolX) mouseX = pSymbolX->value;
+			if (pSymbolY) mouseY = pSymbolY->value;
+		}
+
+		// ------------------------------------------------------------------------
+		// 2. МЕХАНИКА 1: Отставание оружия (Weapon Lag) — Честное и одинаковое везде
+		// ------------------------------------------------------------------------
+		Ang3 targetLag(ZERO);
+
+		if (hasRealWeapon)
+		{
+			targetLag.x = clamp_tpl(mouseY * 0.0020f, -0.15f, 0.15f);
+			targetLag.z = clamp_tpl(mouseX * 0.0020f, -0.20f, 0.20f);
+		}
+
+		float lagBlend = clamp_tpl(8.0f * frameTime, 0.0f, 1.0f);
+		s_weaponLagOffset.x = LERP(s_weaponLagOffset.x, targetLag.x, lagBlend);
+		s_weaponLagOffset.z = LERP(s_weaponLagOffset.z, targetLag.z, lagBlend);
+
+		float returnBlend = clamp_tpl(6.0f * frameTime, 0.0f, 1.0f);
+		s_weaponLagOffset.x = LERP(s_weaponLagOffset.x, 0.0f, returnBlend);
+		s_weaponLagOffset.z = LERP(s_weaponLagOffset.z, 0.0f, returnBlend);
+
+		// ------------------------------------------------------------------------
+		// 3. МЕХАНИКА 2: Отдача (Smart Recoil с усиленной тряской в ADS для автоматов)
+		// ------------------------------------------------------------------------
+		const float fireRateDelay = 0.09f;
+		s_fireTimer -= frameTime;
+
+		bool triggerRecoil = false;
+
+		if (hasRealWeapon && isShooting)
+		{
+			if (isAutomatic)
+			{
+				// Автомат: цикличный таймер стрельбы
+				if (s_fireTimer <= 0.0f)
+				{
+					triggerRecoil = true;
+					s_fireTimer = fireRateDelay;
+				}
+			}
+			else
+			{
+				// Дробовики / Одиночные: СТРОГО 1 ИМПУЛЬС за клик
+				if (!s_wasShooting)
+				{
+					triggerRecoil = true;
+				}
+			}
+		}
+		else
+		{
+			s_fireTimer = 0.0f;
+		}
+
+		s_wasShooting = isShooting;
+
+		// Выполнение толчка и тряски при импакте
+		if (triggerRecoil)
+		{
+			if (isAutomatic)
+			{
+				// --- АВТОМАТ ---
+				// Множитель отдачи (в прицеле чуть сдерживаем подброс ствола)
+				float adsRecoilMultiplier = isZoomed ? 0.5f : 1.0f;
+
+				float randomYaw = cry_random(-0.005f, 0.005f) * adsRecoilMultiplier;
+				float randomRoll = cry_random(-0.005f, 0.005f) * adsRecoilMultiplier;
+
+				s_recoilImpulse.x += 0.014f * adsRecoilMultiplier;
+				s_recoilImpulse.y += randomRoll;
+				s_recoilImpulse.z += randomYaw;
+
+				// Усиленная тряска и кивок FOV в режиме прицеливания для плотного импакта
+				s_fovKick = isZoomed ? 0.002f : 0.002f;
+				s_shakeIntensity = isZoomed ? 0.030f : 0.030f;
+			}
+			else
+			{
+				// --- ДРОБОВИКИ / ОДИНОЧНЫЕ ---
+				float randomYaw = cry_random(-0.015f, 0.015f);
+				float randomRoll = cry_random(-0.1f, 0.1f);
+
+				s_recoilImpulse.x += 0.095f;
+				s_recoilImpulse.y += randomRoll;
+				s_recoilImpulse.z += randomYaw;
+
+				s_fovKick = 0.055f;
+				s_shakeIntensity = 0.040f;
+			}
+
+			if (IViewSystem* pViewSystem = gEnv->pGameFramework ? gEnv->pGameFramework->GetIViewSystem() : nullptr)
+			{
+				if (IView* pView = pViewSystem->GetActiveView())
+				{
+					// Усиленный системный шейк экрана для автоматов в прицеле
+					float viewShakeMult = (isAutomatic && isZoomed) ? 0.4f : 1.0f;
+					pView->SetViewShake(Ang3(0.08f, 0.04f, 0.04f) * viewShakeMult, Vec3(0.02f, 0.02f, 0.02f) * viewShakeMult, 0.12f, 0.07f, 1.0f, 0);
+				}
+			}
+		}
+
+		// Гашение и затухание
+		s_recoilOffset += s_recoilImpulse * (35.0f * frameTime);
+
+		float impulseDamping = clamp_tpl(28.0f * frameTime, 0.0f, 1.0f);
+		s_recoilImpulse = LERP(s_recoilImpulse, Ang3(ZERO), impulseDamping);
+
+		float returnSpeed = clamp_tpl(15.0f * frameTime, 0.0f, 1.0f);
+		s_recoilOffset = LERP(s_recoilOffset, Ang3(ZERO), returnSpeed);
+
+		s_fovKick = LERP(s_fovKick, 0.0f, clamp_tpl(18.0f * frameTime, 0.0f, 1.0f));
+		s_shakeIntensity = LERP(s_shakeIntensity, 0.0f, clamp_tpl(22.0f * frameTime, 0.0f, 1.0f));
+
+		Ang3 cameraShake(ZERO);
+		if (s_shakeIntensity > 0.001f)
+		{
+			cameraShake.x = cry_random(-s_shakeIntensity, s_shakeIntensity);
+			cameraShake.y = cry_random(-s_shakeIntensity, s_shakeIntensity);
+			cameraShake.z = cry_random(-s_shakeIntensity, s_shakeIntensity);
+		}
+
+		// ------------------------------------------------------------------------
+		// 4. Применение к камере
+		// ------------------------------------------------------------------------
+		Quat weaponLagRot = Quat::CreateRotationXYZ(Ang3(s_weaponLagOffset.x, 0.0f, s_weaponLagOffset.z));
+		Quat recoilShakeRot = Quat::CreateRotationXYZ(s_recoilOffset + cameraShake);
+
+		viewParams.rotation = viewParams.rotation * weaponLagRot * recoilShakeRot;
+		viewParams.fov -= s_fovKick;
+	}
+
+	// --- Dynamic Camera Roll & Standstill Mouse Tilt (Ultra Smooth) ---
+	if (IsClient())
+	{
+		static float s_smoothedStrafeRoll = 0.0f;
+		static float s_smoothedMouseRoll = 0.0f;
+		static float s_mouseRollVelocity = 0.0f; // Инерция скорости мыши
+		static Ang3  s_cameraLagOffset(ZERO);
+
+		const float frameTime = gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.016f;
+
+		// -------------------------------------------------------------
+		// 1. СЫРОЙ ИМПУЛЬС И ПЛАВНАЯ ИНЕРЦИЯ МЫШИ НА МЕСТЕ
+		// -------------------------------------------------------------
+		float mouseX = 0.0f;
+		float mouseY = 0.0f;
+
+		if (gEnv->pInput)
+		{
+			const SInputSymbol* pSymbolX = gEnv->pInput->GetSymbolByName("maxis_x");
+			const SInputSymbol* pSymbolY = gEnv->pInput->GetSymbolByName("maxis_y");
+
+			if (pSymbolX) mouseX = pSymbolX->value;
+			if (pSymbolY) mouseY = pSymbolY->value;
+		}
+
+		// Рассчитываем целевой наклон (уменьшили чувствительность с 0.015f до 0.005f для мягкости)
+		float targetMouseRoll = mouseX * 0.005f;
+		targetMouseRoll = clamp_tpl(targetMouseRoll, -0.15f, 0.15f); // Ограничение крена (~8.5 градусов)
+
+		// Двухэтапное сглаживание:
+		// 1) Набираем скорость наклона через LERP
+		float accelBlend = clamp_tpl(5.0f * frameTime, 0.0f, 1.0f); // 5.0f — чем меньше, тем плавнее разгон
+		s_mouseRollVelocity = LERP(s_mouseRollVelocity, targetMouseRoll, accelBlend);
+
+		// 2) Применяем инерцию и плавно возвращаем в ноль (возврат шеи)
+		float decayBlend = clamp_tpl(4.0f * frameTime, 0.0f, 1.0f);  // 4.0f — скорость возврата в центр
+		s_smoothedMouseRoll = LERP(s_smoothedMouseRoll, s_mouseRollVelocity, accelBlend);
+		s_mouseRollVelocity = LERP(s_mouseRollVelocity, 0.0f, decayBlend);
+
+		// Camera Lag (инерция отставания)
+		Ang3 targetLag;
+		targetLag.x = -mouseY * 0.003f;
+		targetLag.y = -mouseX * 0.003f;
+
+		targetLag.x = clamp_tpl(targetLag.x, -0.06f, 0.06f);
+		targetLag.y = clamp_tpl(targetLag.y, -0.06f, 0.06f);
+
+		float lagBlend = clamp_tpl(10.0f * frameTime, 0.0f, 1.0f);
+		s_cameraLagOffset.x = LERP(s_cameraLagOffset.x, targetLag.x, lagBlend);
+		s_cameraLagOffset.y = LERP(s_cameraLagOffset.y, targetLag.y, lagBlend);
+
+		// -------------------------------------------------------------
+		// 2. CAMERA ROLL ОТ СТРЕЙФОВ (A/D)
+		// -------------------------------------------------------------
+		Vec3 velocity = ZERO;
+		IPhysicalEntity* pPhys = GetEntity() ? GetEntity()->GetPhysics() : nullptr;
+		if (pPhys)
+		{
+			pe_status_dynamics status;
+			if (pPhys->GetStatus(&status))
+			{
+				velocity = status.v;
+			}
+		}
+
+		Matrix33 viewRot(viewParams.rotation);
+		Vec3 rightDir = viewRot.GetColumn0();
+		float strafeSpeed = velocity.Dot(rightDir);
+
+		float targetStrafeRoll = strafeSpeed * 0.025f;
+		targetStrafeRoll = clamp_tpl(targetStrafeRoll, -0.20f, 0.20f);
+
+		float rollBlend = clamp_tpl(8.0f * frameTime, 0.0f, 1.0f);
+		s_smoothedStrafeRoll = LERP(s_smoothedStrafeRoll, targetStrafeRoll, rollBlend);
+
+		// -------------------------------------------------------------
+		// 3. СУММИРОВАНИЕ И ПРИМЕНЕНИЕ
+		// -------------------------------------------------------------
+		float totalRoll = s_smoothedStrafeRoll + s_smoothedMouseRoll;
+
+		Quat lagRot = Quat::CreateRotationXYZ(Ang3(s_cameraLagOffset.x, s_cameraLagOffset.y, 0.0f));
+		Quat rollRot = Quat::CreateRotationVDir(Vec3(0, 1, 0), totalRoll);
+
+		viewParams.rotation = viewParams.rotation * lagRot * rollRot;
+
+#if !defined(_RELEASE)
+		CryWatch("MouseX: %.2f | Mouse Roll: %.3f | Total Roll: %.3f",
+			mouseX, s_smoothedMouseRoll, totalRoll);
+#endif
+	}
 }
 
 void CPlayer::PostUpdateView(SViewParams& viewParams)

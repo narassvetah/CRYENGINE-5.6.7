@@ -1,0 +1,96 @@
+////////////////////////////////////////////////////////////////////////////
+//  ScopeLens shader extension (flags for the scope / sight lens shader)
+//  Based on the Glass shader template
+////////////////////////////////////////////////////////////////////////////
+
+Version (2.00)
+
+UsesCommonGlobalFlags
+
+Property
+{
+  Name = %LENS_CHROMA
+  Mask = 0x10
+  Property    (Chromatic aberration)
+  Description (Radial RGB split that grows toward the rim of the lens)
+}
+
+Property
+{
+  Name = %EDGE_BLUR
+  Mask = 0x20
+  Property    (Edge defocus blur)
+  Description (Soft defocus blur at the edges of the glass, 6 extra taps only near the rim)
+}
+
+Property
+{
+  Name = %NO_DOT
+  Mask = 0x200
+  Property    (Remove center dot)
+  Description (Hides the central marker dot on every reticle)
+}
+
+Property
+{
+  Name = %LENS_DIRT
+  Mask = 0x400
+  Property    (Dust and scratches)
+  Description (Procedural dust and micro-scratches that show up on bright parts of the image)
+}
+
+Property
+{
+  Name = %COATING
+  Mask = 0x1000
+  Property    (Anti-reflective coating)
+  Description (Violet / green or blue sheen of the glass visible at an angle)
+}
+
+Property
+{
+  Name = %BROKEN_GLASS
+  Mask = 0x2000
+  Property    (Broken glass, normal map)
+  Description (Cracked glass from the Bumpmap slot - refraction of the image and crack sheen)
+}
+
+Property
+{
+  Name = %SCOPE_RTT
+  Mask = 0x8000
+  Property    (Scope image from render texture)
+  Description (Sharp image from a second camera in the Custom texture slot instead of zooming the screen. Set Source FOV to the FOV of that camera)
+}
+
+Property
+{
+  Name = %SPECULAR_MAP
+  Mask = 0x200000
+  Property    (Specular map)
+  Description (Sun reflection highlights on the glass - the Specular map of the material gives their mask and color)
+}
+
+Property
+{
+  Name = %LENS_TINT
+  Mask = 0x4000
+  Property    (Lens tint)
+  Description (Color filter of the glass - the image is multiplied by Tint Color)
+}
+
+Property
+{
+  Name = %TINT_GRADIENT
+  Mask = 0x100000
+  Property    (Tint gradient)
+  Description (Gradient tint from Tint Color to Tint Gradient Color along Tint Gradient Angle. Needs Lens tint)
+}
+
+Property
+{
+  Name = %RETICLE_FFP
+  Mask = 0x800
+  Property    (First focal plane reticle)
+  Description (The reticle grows with the zoom like in a first focal plane scope. Without it the reticle keeps a constant size like in a second focal plane scope)
+}
